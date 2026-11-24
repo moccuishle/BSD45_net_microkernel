@@ -434,3 +434,158 @@ triple fault，而不是锁本身。
   `exp/microkernel`（见 `bsd45/RESUME-TASK.md` 的 S100 节）。
 - **路线 A（真·移植 4.5BSD 内核核心）**：恢复 `vfs_bio.c` 删除体、生成
   `vnode_if.h`、带起完整 kern/* 与 VFS 初始化，长期方向，当前验收用不上。
+
+---
+
+## 7. 下次开工清单（2026-11-25，按优先级排好，可直接动手）
+
+> 把 §6.1 / §6.2.2 / §6.3 / §6.4 里"未完成"的事项收敛成任务卡：每张卡都给出
+> **代码起点 → 前置依赖 → 动手步骤 → 验收命令 → 已知坑**。
+> 当前 HEAD `b75deba`，5 仓树一致 `6b88cbb`，工作区干净。
+> 开工前先读 §6.2.2（BKL 拆分状态）与 §6.2.4（构建/测试工具与三个坑）。
+
+### 7.0 每次开工的固定动作
+
+1. 构建：`bash build_all.sh`（Linux）/ PowerShell 脚本（Windows）；改了内核再
+   `bash build_iso.sh`，产物 `out/BSD45-ELF-x86.iso`。
+2. 8 核回归基线（Windows 下）：
+   ```sh
+   export PATH=/c/msys64/ucrt64/bin:$PATH MSYS_NO_PATHCONV=1
+   python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 \
+       --timeout 900 --cmd smpon --cmd smpuser --cmd "shell+12" \
+       --cmd "/bin/pthread+40" --cmd "/bin/pthmain+35" \
+       --cmd "/bin/pthpre+35" --cmd "/bin/aiotest+35" \
+       --cmd ps --cmd "exit 0" --log reg.log
+   ```
+   判据：`pthread` / `pthmain` / `pthpre` / `aiotest` 全 PASS；TRAP、triple
+   fault、`STACK OVERFLOW`、`address space busy` 全 0。
+3. 任何内核改动后都要跑全套验收 `tools/all_tests.sh`（15 套）。
+4. 抓 triple fault 用 `--qemu-extra=-d --qemu-extra=cpu_reset --qemu-extra=-D
+   --qemu-extra=diag_cpu.log`；**以 `-` 开头的值必须写成等号形式**，
+   `--qemu-extra -d` 会被 argparse 当成新选项直接退出。
+5. 上库：主仓 `git push origin main`；4 个镜像用
+   `git commit-tree $(git rev-parse HEAD^{tree}) -p <remote>/main` 生成提交后
+   push，最后 `git fetch` 校验 5 棵树一致。
+
+### 7.1 P1 — 长时间 soak，再把 `smp_user_dispatch` 默认改为 1（§6.1.1 / 6.1.2）
+
+- **代码起点**：定义 `kernel/sys/usermode.c:4163`（`int smp_user_dispatch = 0;`）；
+  生效点 `kernel/sys/usermode.c:3982`（`cid == 0 || smp_user_dispatch` 才允许
+  AP 派发用户线程）；手动开关 `kernel/sys/mon.c:417`（`smpuser` 命令）。
+- **前置认知**：TRAP 12 只是**收敛**、未从机制上根治——很可能是 S421 修正
+  CR3 / `cur_pd` 失配的连带效果，而非独立根因。故障曾为极低频偶发。
+- **动手步骤**：
+  1. 数小时混合负载 soak：循环 `smpon` + `smpuser` + `shell`，反复跑
+     `ls /bin`、`cat`、`ps`、`uname`、`date`、`/bin/pthread`，间歇夹一轮
+     `/bin/proctest`。逐轮记录 TRAP / 异常计数。
+  2. 连续 0 复现后把 `usermode.c:4163` 改为 `= 1`；`smpuser` 开关保留为
+     "强制退回 BSP-only" 的应急手段。
+  3. 重跑 7.0 全套 + 15 套验收，特别验证**不发 `smpuser`** 的默认启动路径。
+- **验收**：数小时 0 次 TRAP 12 / triple fault / kernel TRAP；默认启动下
+  `ps` 与多线程测试仍 PASS，cpu1–cpu7 都参与调度。
+- **坑**：若 soak 中复现，按 `os_smp.md` §12/§15 的反汇编方法
+  （`cmpl $1,(%eax)`、崩溃点 `cpus[cid].ci_curthread`）重新取证；**不要靠
+  "再加一把锁"规避**——S422 就是池锁 vs BKL 锁序反转导致硬死锁（时钟静止）。
+  `proctest` 在 TCG 下回收 1000 子进程极慢，只当间歇负载，别拿它的停顿判定死锁。
+
+### 7.2 P2 — #10 第 ④ 步：VFS / pipe / pagecache / fd 表分锁
+
+> 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
+> BKL**，反过来必炸。第 ③ 步（7.3）排在它之后。
+
+- **代码起点**：
+  - 系统调用入口：`kernel/sys/usermode.c:7492` 附近
+    （`smp_bkl_enter()` → `bsd45_syscall(r)` → `softirq_dispatch()` →
+    `smp_bkl_exit()`）；缺页分发 `kernel/arch/i386/i386/trap.c:213`。
+  - BKL 合同与实现：`kernel/sys/usermode.c:4230-4290`
+    （`smp_bkl_enter/exit/drop/held`，同 CPU 嵌套计数）。
+  - fd 表：`kernel/sys/kern_descrip.c`（`p->p_fd`、`fd_ofiles`、
+    `fd_ofileflags`、`fd_nfiles`）与 `usermode.c` 的 `NFD` / `cur->uk_fd`。
+  - VFS：`kernel/fs/vfs.c`、`vfs_cache.c`（namei 缓存）、`vfs_bio.c`
+    （buf 缓存）、`kernel/fs/tmpfs.c`。
+  - pipe：`kernel/sys/usermode.c` 内的实现（`init_sysent.c` 有 `sys_pipe` 条目）。
+  - pagecache / bufcache：`kernel/fs/*.c` 与 `usermode.c` 的 `pagecache_*`
+    （S17 的 LRU / hash 链表，目前无锁，见 §6.2）。
+  - 现成锁可参照：`page_lock`、`pmap_lock`（`usermode.c`）、
+    `zc_lock`（`kernel/vm/zcomp.c`）、`sc_rqlock`（`usermode.c`）、
+    `proc_table_lock`；`struct spinlock` 的实现在 `kernel/arch/i386/smp.c`。
+- **锁序（全局固定，写进注释）**：`BKL → sc_rqlock`、`BKL → page_lock`、
+  `pmap_lock → page_lock`、`pmap_lock → zc_lock`。**任何子系统锁都不能在持有
+  时反过来等 BKL**；`page_alloc()` 取 `page_lock` 后必须 pop 完就放，再进
+  `zcomp_reclaim()`。S422 的硬死锁就是违反这条。
+- **动手步骤**：一次只给**一个**子系统加锁 + **一条**系统调用路径试摘 BKL，
+  跑完 7.0 全套再进下一个；禁止一次性大改。锁统一用
+  `spin_init/spin_lock/spin_unlock`，不要引入新的锁类型。
+- **验收**：8 核下 `proctest` phase A/B、`pthread`、`aiotest`、`ls/cat/ps`
+  全过；`-d cpu_reset` 确认无 triple fault；特别留意"加锁后时钟静止"型死锁。
+- **坑**：S430 两次失败都源于"以为只改一个 PTE / 一条链就安全"。fork / exec /
+  exit 会在 BKL 内临时切走 CR3，缺页与系统调用必须整体看待；`in_fault`
+  必须保持每 CPU（`in_fault_cpu[MAXCPU]`），否则 A 核的缺页保护会被 B 核清掉。
+
+### 7.3 P3 — #10 第 ③ 步：缺页离开 BKL（**必须等 7.2 完成**）
+
+- **代码起点**：`kernel/sys/usermode.c:3563` 的 `user_page_fault()`
+  （`smp_bkl_enter()` → `in_fault=1` → `user_page_fault_locked()` →
+  `in_fault=0` → `smp_bkl_exit()`）。四条路径：`demand_zero` /
+  `user_map_if_absent`、`cow_fault`、`zcomp_refault`、vma 文件映射。
+- **前置**：7.2 完成；S431 已就位的 ①②（`pmap_lock` 递归、COW 原子
+  `page_ref_add()`、`zc_lock`、每 CPU `in_fault`）是必要条件而非充分条件。
+- **已知失败，别重蹈（S430）**：把"单线程进程的堆/栈按需零页"做成不进 BKL
+  的快路径，依据是 `uk_p_nthreads == 1` 时地址空间只有当前线程。
+  `proctest` phase B 先大面积 `smp: STACK OVERFLOW tid 6`，补上
+  "当前 CR3 必须 == `cur->uk_pd`" 的判定后直接 triple fault。
+- **正确方向**：把 CR3 归属判定做成**"错了就放弃、回到 BKL 路径重试"**，
+  而不是断言"单线程就安全"；重试路径要能处理 fork/exec/exit 临时切 CR3
+  的窗口，以及 COW 引用计数与 zcomp 状态。
+- **验收**：7.0 全套 + 并发 fork/exec/exit 与 mmap 混跑；用
+  `--qemu-extra=-d --qemu-extra=int,cpu_reset` 抓 triple fault。
+
+### 7.4 P4 — §6.3 调度 / 作业控制功能缺口
+
+- **代码起点**：sh 是 4.5BSD-Lite2，源码在 `libc/arch/bsd/bin/sh/`，
+  **已有 `jobs.c`（作业表）**、`options.c`（`set -m`）、`exec.c`、`redir.c`。
+  内核侧 `kernel/include/sys/tty.h:166/170` 已有 `isctty()` /
+  `isbackground()` 宏，`TIOCSPGRP` 在 `ttycom.h:93`，`SIGTTIN` 在
+  `signal.h:81`，`p_pgrp` / `p_session` 在 `sys/kprocess.h`。
+- **动手步骤**：
+  1. sh 的 `options.c` 接通 `-m`，`jobs.c` 用 `setpgid` / `tcsetpgrp`
+     真正切换前台进程组；
+  2. 终端读路径（`kernel/driver/pccon.c` / tty 层）加后台读 `SIGTTIN`，
+     配合 `kern_sig.c` 的 stop / continue；
+  3. `/bin/kill`（`libexec/kill.c`）支持 `%job` 写法；
+  4. per-process tty / session 落地后 `ps -a` / `-x` 才有真实 BSD 语义
+     （当前 `ps` 列出全部进程）；
+  5. `libexec/sleep.c` 说明 libc `sleep()` 目前是忙等且 `tv_usec` 恒 0；
+     真 sleep 要先有超时队列 / 时钟中断等待（与 S10.2 / S16 同源），
+     属内核侧依赖，放在最后。
+- **依赖**：先核对 `kern_proc.c` / `kern_sig.c` / tty 层的
+  `setpgid` / `tcsetpgrp` / `SIGTTOU` / `SIGTTIN` 通路是否完整，再动 sh。
+- **验收**：`sh -m` 下 `cmd &` → `fg` / `bg` → `Ctrl-Z` → `jobs` /
+  `kill %1`；后台读终端被 `SIGTTIN` 停住；`ps -a/-x` 输出正确。
+
+### 7.5 P5 — §6.4 长期路线（仅登记入口，未开工）
+
+- **demand paging + COW**：`mmap` 目前只支持 offset 0、`MAP_PRIVATE` 是
+  map 时复制；升级到缺页复制**依赖 7.3**（当前用户态 fault 停机）。
+- **B4 UFS/FFS**：缺 ATA 硬盘驱动，`kernel/fs/ufs/*` 无实现，继续暂缓。
+- **S100 微内核化**：`S100.2a`（tmpfs 从 `vfs.c` 拆出）已做；
+  `S100.3`（KP-4/6/7 + `fs_server` 最小实验）、`S100.4`（宏/微度量对照）
+  未开工。硬约束：不许牺牲 15 套验收、先文档后代码、实验放独立分支
+  `exp/microkernel`（见 `bsd45/RESUME-TASK.md` 的 S100 节）。
+- **路线 A**：恢复 `vfs_bio.c` 删除体、生成 `vnode_if.h`、带起完整 kern/*
+  与 VFS 初始化。
+- **turnstile**：见 §5，四个前提（可睡眠锁 / 多 donor 争同一锁 / 锁嵌套 /
+  实时性要求）凑齐前**不要上**，当前 TCB 标量继承够用。
+
+### 7.6 明确不必做的事（避免重复劳动）
+
+- §6.1.3 `kthread_reap()` 锁域错配：加锁实验与不加锁基线各 8 轮全过、
+  无区分度，改动已回退；除非能稳定复现，否则不要动。
+- §6.1.6 `foreground was ...` 焦点提示：VMware 窗口 / 键盘工具问题，
+  对照实验证明两版 TRAP 均为 0，非内核死锁。
+- `proctest` 停在 `1002 live processes`：TCG 下回收 1000 子进程极慢，
+  `-d cpu_reset` 已排除 triple fault（§6.2.4），不要当退出路径死锁去修。
+- 缺页"单线程就安全"快路径：S430 两次失败（STACK OVERFLOW → triple
+  fault），该思路永久放弃。
+- 给槽位发布加 `kthread_alloc_lock`（S422 首版）：会与 BKL 锁序反转，
+  正确做法是无锁发布 + 最后 `atomic_xchg(&t_used, 0)`。
