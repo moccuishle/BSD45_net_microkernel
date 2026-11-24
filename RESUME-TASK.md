@@ -332,7 +332,8 @@ zcomp 状态，这些都还没有自己的锁。**因此缺页路径在 pmap/COW
 
 下一步（按依赖顺序）：①`pmap_lock`（页表页分配 + PTE 写入，含 CR3 归属判定）
 → ②COW 引用计数与 zcomp 加锁 → ③缺页才能离开 BKL → ④VFS/pipe/fd 表按子系统
-加锁后再放系统调用入口。
+加锁后再放系统调用入口。**进度：①② 已由 S431 完成（见 §6.2.3）；③④ 仍未做，
+是当前 #10 的剩余工作。**
 
 
 ### 6.2.3 pmap 锁 + COW 引用计数 + zcomp 锁（S431，路线图第 ① ② 步）
@@ -370,6 +371,45 @@ S430 只把页分配器摘出 BKL。S431 补齐缺页路径另外两块共享状
 先把 VFS/pagecache/pipe/fd 表按子系统加锁（第 ④ 步），或者把缺页的 CR3 归属
 判定做成"错了就放弃、回到 BKL 路径重试"的机制——S430 试过一次，失败在
 triple fault，而不是锁本身。
+
+### 6.2.4 构建链 / 测试工具与本次同步（S432，2026-11-25）
+
+- **`hdd/mkjlfs.sh` 在 Windows 上"卡死"不是死循环**：MSYS2 没有 `fork(2)`，
+  每 spawn 一个外部进程约 0.25–0.5 s；脚本原来每个十六进制字段都走
+  `$(printf)/$(seq)/xxd/tr`、每个 4 KB 文件块一个 `dd`，3 MB 镜像要 30 分钟
+  以上（Linux bash 上几秒，所以一直没暴露）。现在 `le_hex/hex_set_le/
+  hex_get_le/hex_set_bit` 全用 `printf -v` + 算术展开，文件名用
+  `printf '%02x' "'c"` 代替 `xxd|tr`，inode 表在内存里拼好一次 `dd` 写出，
+  文件数据按连续块合并成一次 `dd`：**30 min → 76 s**，输出与 `mkjlfs.py`
+  逐字节一致。
+- **顺带修掉一个真 bug**：`.sh` 版**从未写入 cylinder-group 块**
+  （`fs_csaddr` 处一直是全零），内核每次挂载都走
+  `jlfs: rebuilding allocation bitmap`。现在写入的就是 `jlfs.c:cg_rebuild()`
+  会算出的位图，与 `mkjlfs.ps1`/`.py` 一致；`hdd/BSD45.JLFS` 已重新生成。
+- **测试工具**：`tools/run_qemu_test.sh` 增加 `-Smp/-Mem`；新增
+  `tools/qdrive.py`（Python 驱动 QEMU TCP 串口，因为 Git Bash 的 `/dev/tcp`
+  能连上但收不到数据）。两条踩过的坑：
+  1. `qdrive` **必须在等待命令期间持续读串口**。原来 `time.sleep(700)`
+     期间不读，QEMU 的 socket 缓冲填满后 guest 直接阻塞在 `printf` 里，
+     `proctest` 压测表现为超时假死（`rc=124`）而内核其实没事（`3b91fbe` 修正）。
+  2. Windows 上调用必须 `MSYS_NO_PATHCONV=1`，否则 `/bin/pthread` 会被
+     MSYS 改写成 `C:/.../usr/bin/pthread`，guest 报 `not found`。
+  3. 传以 `-` 开头的参数要用 `--qemu-extra=-d` 这种等号形式，写成
+     `--qemu-extra -d` 会被 argparse 当成新选项而直接退出（`rc=2`）。
+- **`proctest` 的"卡住"不是内核死锁**：8 vCPU / 3 GB TCG 下它打印
+  `kernel /dev/ps lists 1002 live processes` 后会长时间没有输出——1000 个
+  子进程的 `kill(SIGKILL)` + `wait4` 回收在 TCG 下极慢，历次验证都只到
+  phase B。用 `--qemu-extra=-d --qemu-extra=cpu_reset --qemu-extra=-D`
+  抓过一次：CPU0 的两次 reset 都是初始实模式（`EIP=0000fff0`、
+  `EDX=00000663`，属 QEMU 启动 / `smpon` 的 INIT-SIPI 序列），内核运行期间
+  没有任何新增 reset，寄存器也从未进入保护模式/内核地址，**排除 triple fault**。
+  不要据此去改退出路径。
+- **5 仓同步状态**：主仓 `BSD45_multi_core_process` → `3b91fbe`；镜像
+  `BSD45_microkernel` → `5ffc6cb`、`BSD45_device_microkernel` → `41c609d`、
+  `BSD45_net_microkernel` → `103b629`、`BSD45_multiprocess_allocation` →
+  `b97f242`；5 棵树同为 `28965c8`。（`microkernel` 这个 remote 是
+  `BSD45_microkernel` 的重复配置，指向同一仓库。）上表是 S432 首次同步时的
+  提交号，之后每次文档/工具提交仍按同样方式用 `commit-tree` 推进 4 个镜像。
 
 ### 6.3 调度 / 作业控制功能缺口
 

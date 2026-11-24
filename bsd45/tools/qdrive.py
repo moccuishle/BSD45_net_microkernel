@@ -26,6 +26,9 @@ def main():
     ap.add_argument("--gap", type=float, default=1.5)
     ap.add_argument("--log", default="")
     ap.add_argument("--cmd", action="append", default=[])
+    ap.add_argument("--qemu-extra", action="append", default=[],
+                    help="extra QEMU argument, repeatable (e.g. "
+                         "--qemu-extra -d --qemu-extra cpu_reset)")
     args = ap.parse_args()
 
     qemu = None
@@ -34,7 +37,7 @@ def main():
     port = 6000 + (os.getpid() % 500)
     argv = [qemu, "-cdrom", args.iso, "-boot", "d", "-m", args.mem,
             "-smp", args.smp, "-display", "none", "-no-reboot",
-            "-monitor", "none",
+            "-monitor", "none"] + args.qemu_extra + [
             "-serial", "tcp:127.0.0.1:%d,server=on,wait=off" % port]
     proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
