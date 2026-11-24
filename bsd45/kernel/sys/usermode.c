@@ -919,6 +919,66 @@ static unsigned page_free_list;
 static unsigned page_nalloc, page_nfree, page_ninuse;
 
 /*
+ * S431: guard for the user page tables (step 1 of the S430 roadmap: a lock
+ * that is correct on its own, so the BKL can be dropped path by path).
+ *
+ * Scope: every write to a user page directory, a user page table or a user
+ * PTE, plus the page-table page allocation that goes with it.  It is one
+ * global lock rather than one per address space: page tables are walked from
+ * more than one address space at a time (fork copies the parent while the
+ * child's CR3 is live) and the hot path is a single PTE store, so per-space
+ * locking would buy nothing but a lookup.
+ *
+ * It is deliberately *recursive on the owning CPU*.  user_map() has to
+ * allocate a page-table page in the middle of an edit, page_alloc() may call
+ * zcomp_reclaim(), and that walks the very page tables the caller is
+ * editing.  Forbidding that re-entry would mean restructuring every helper
+ * into "allocate first, edit second", and the reclaim would still be free to
+ * compress the PTE we are about to overwrite.  Recursion makes the re-entry
+ * harmless: same CPU, same edit sequence, no second lock.
+ *
+ * Ordering: pmap_lock -> page_lock (user_map allocates a table page while
+ * holding it) and pmap_lock -> zcomp lock (free_address_space/zcomp_reclaim).
+ * Nothing takes either of those and then asks for pmap_lock.
+ *
+ * 用户页表锁（S430 路线图第 1 步）。范围：用户页目录/页表/PTE 的任何写入，
+ * 以及随之而来的页表页分配。用一把全局锁而不是每个地址空间一把：fork 会一边
+ * 拷父进程一边让子进程的 CR3 生效，热点又只是一条 PTE 存储，按地址空间分锁
+ * 只多一次查找。这把锁**对持有它的 CPU 可递归**：user_map 在编辑中途要分配
+ * 页表页，page_alloc 可能进入 zcomp_reclaim，而后者恰好会遍历调用方正改的
+ * 页表。禁止重入就得把每个辅助函数改成“先分配后编辑”，而且回收依然可以压缩
+ * 我们即将覆盖的那个 PTE。递归让重入无害：同一个 CPU、同一段编辑、不取第二
+ * 把锁。锁序：pmap_lock -> page_lock、pmap_lock -> zcomp 锁，反向没有路径。
+ */
+static struct spinlock	pmap_lock;
+static volatile int	pmap_owner = -1;	/* cpu_id() of the holder */
+static int		pmap_depth;		/* recursion depth (owner only) */
+
+static void
+pmap_lock_enter(void)
+{
+	int me = cpu_id();
+
+	if (pmap_owner == me) {
+		pmap_depth++;
+		return;
+	}
+	spin_lock(&pmap_lock);
+	pmap_owner = me;
+	pmap_depth = 1;
+}
+
+static void
+pmap_lock_exit(void)
+{
+
+	if (--pmap_depth > 0)
+		return;
+	pmap_owner = -1;
+	spin_unlock(&pmap_lock);
+}
+
+/*
  * COW reference counts (os.md mechanism 2/3).  One 16-bit count per physical
  * page (S410; it was a byte, which could not describe 1000 sharers).
  *
@@ -1013,30 +1073,53 @@ page_ref_get(unsigned pa)
 	return (i != 0 ? page_ref[i] : 1);
 }
 
-/* 中文：递增物理页的 COW 引用计数，上限 65535，超出表范围则忽略 */
-/* EN: Increment a physical page's COW reference count up to 65535, ignoring pages outside the table */
+/*
+ * S431: atomic 16-bit add.  The refcounts are read and written from more
+ * than one CPU now (a fork on CPU A bumps the count while the other process
+ * on CPU B drops it in exit), and a plain ++ compiles to load/add/store, so
+ * two CPUs could lose an increment and page_put() would then free a page
+ * that is still mapped.  `lock xaddw` is one instruction and returns the old
+ * value, which is what the "am I the last user" decision needs.
+ * 16 位原子加。引用计数现在会被多个 CPU 触碰（A 核 fork 时加，B 核 exit 时减），
+ * 普通 ++ 会编译成 load/add/store，两个 CPU 可能丢掉一次自增，page_put() 就会
+ * 释放仍在映射的页。`lock xaddw` 一条指令并返回旧值，正是"我是不是最后一个"
+ * 所需的语义。
+ */
+static unsigned
+page_ref_add(unsigned pa, int delta)
+{
+	unsigned i = page_index(pa);
+	unsigned short d;
+
+	if (i == 0)
+		return (0);
+	d = (unsigned short)delta;
+	__asm __volatile("lock; xaddw %0,%1"
+	    : "+r" (d), "+m" (page_ref[i])
+	    :
+	    : "memory");
+	return ((unsigned)d);		/* the value before the add */
+}
+
+/* 中文：递增物理页的 COW 引用计数（原子），超出表范围则忽略 */
+/* EN: Atomically increment a physical page's COW reference count, ignoring pages outside the table */
 static void
 page_ref_inc(unsigned pa)
 {
-	unsigned i = page_index(pa);
 
-	if (i != 0 && page_ref[i] < 65535)
-		page_ref[i]++;
+	(void)page_ref_add(pa, 1);
 }
 
-/* 中文：释放对物理页的一次引用：引用计数大于 1 则递减，否则把页放回空闲链表 */
-/* EN: Release one reference to a physical page: decrement the count if greater than 1, otherwise return the page to the free list */
+/* 中文：释放对物理页的一次引用（原子）：旧值大于 1 只递减，否则清零并放回空闲链表 */
+/* EN: Release one reference to a physical page (atomically): decrement when the old value was above 1, otherwise clear it and return the page to the free list */
 static void
 page_put(unsigned pa)
 {
-	unsigned i = page_index(pa);
+	unsigned old = page_ref_add(pa, -1);
 
-	if (i != 0 && page_ref[i] > 1) {
-		page_ref[i]--;
-		return;
-	}
-	if (i != 0)
-		page_ref[i] = 0;
+	if (old > 1)
+		return;			/* another mapping still uses it */
+	page_ref_set(pa, 0);
 	page_free(pa);
 }
 
@@ -1163,7 +1246,18 @@ static int in_zcomp;
  * 写入的页或重试指令要访问的页，指令再次缺页，两者互相追逐。1000 个子进程时
  * 机器就卡在第 417 个，CR2 固定在某一个栈页上。
  */
-static int in_fault;
+/*
+ * S431: per CPU.  It used to be one global flag, which meant a fault on CPU
+ * A also silenced reclaim for a faulting CPU B - and, worse, CPU B clearing
+ * the flag when it finished re-enabled reclaim inside CPU A's handler, which
+ * is exactly the livelock described above.  Only the CPU that is actually
+ * inside its own fault handler may suppress its own reclaim.
+ * 改为每 CPU 一份。原来是全局标志：A 核缺页会让 B 核的缺页也失去保护；更糟的是
+ * B 核退出处理时把标志清掉，A 核的处理程序里回收又被放开，正是上面那种活锁。
+ * 只有真正处在自己缺页处理中的 CPU 才能抑制自己的回收。
+ */
+static int in_fault_cpu[MAXCPU];
+#define	in_fault	(in_fault_cpu[cpu_id()])
 static int user_ok(unsigned p, unsigned len);
 static int user_ok_w(unsigned p, unsigned len);
 static void proc_sched(void);
@@ -1313,6 +1407,7 @@ free_address_space(unsigned pdpa)
 	unsigned *pd = map_page(SCRATCH_PD, pdpa);
 	int i, j;
 
+	pmap_lock_enter();
 	for (i = 0; i < USER_PDE_LIMIT; i++) {
 		unsigned *pt;
 
@@ -1331,6 +1426,7 @@ free_address_space(unsigned pdpa)
 		pd[i] = 0;
 	}
 	page_free(pdpa);
+	pmap_lock_exit();
 }
 
 /* 中文：把物理页 pa 映射可读写到内核临时虚拟地址 va，并返回该虚拟地址 */
@@ -1361,9 +1457,13 @@ zero_page(unsigned pa)
 static unsigned
 user_pd_create(void)
 {
-	unsigned pdpa = page_alloc();
-	unsigned *pd = map_page(SCRATCH_PD, pdpa);
+	unsigned pdpa;
+	unsigned *pd;
 	int i;
+
+	pmap_lock_enter();
+	pdpa = page_alloc();
+	pd = map_page(SCRATCH_PD, pdpa);
 
 	for (i = 0; i < PAGE_SIZE / 4; i++)
 		pd[i] = 0;
@@ -1379,6 +1479,7 @@ user_pd_create(void)
 	 */
 	for (i = 0x3ec; i <= 0x3fd; i++)
 		pd[i] = ((unsigned *)kernel_pmap->pm_pdir)[i];
+	pmap_lock_exit();
 	return (pdpa);
 }
 
@@ -1393,11 +1494,12 @@ static void
 user_map(unsigned pdpa, unsigned va, unsigned pa)
 {
 	unsigned pdi = va >> 22, pti = (va >> 12) & 0x3ff;
-	unsigned *pd = map_page(SCRATCH_PD, pdpa);
-	unsigned *pt;
+	unsigned *pd, *pt;
 	unsigned ptpa;
 	int i;
 
+	pmap_lock_enter();
+	pd = map_page(SCRATCH_PD, pdpa);
 	if ((pd[pdi] & PG_V) == 0) {
 		ptpa = page_alloc();
 		pt = map_page(SCRATCH_PT, ptpa);
@@ -1409,6 +1511,7 @@ user_map(unsigned pdpa, unsigned va, unsigned pa)
 		pt = map_page(SCRATCH_PT, ptpa);
 	}
 	pt[pti] = pa | PG_V | PG_RW | PG_u;
+	pmap_lock_exit();
 }
 
 /*
@@ -1440,11 +1543,12 @@ static void
 user_map_prot(unsigned pdpa, unsigned va, unsigned pa, int prot)
 {
 	unsigned pdi = va >> 22, pti = (va >> 12) & 0x3ff;
-	unsigned *pd = map_page(SCRATCH_PD, pdpa);
-	unsigned *pt;
+	unsigned *pd, *pt;
 	unsigned ptpa;
 	int i;
 
+	pmap_lock_enter();
+	pd = map_page(SCRATCH_PD, pdpa);
 	if ((pd[pdi] & PG_V) == 0) {
 		ptpa = page_alloc();
 		pt = map_page(SCRATCH_PT, ptpa);
@@ -1457,6 +1561,47 @@ user_map_prot(unsigned pdpa, unsigned va, unsigned pa, int prot)
 	}
 	pt[pti] = pa | PG_V | PG_u |
 	    ((prot & PROT_WRITE) ? PG_RW : 0);
+	pmap_lock_exit();
+}
+
+/*
+ * S431: install pa at va only when the PTE is still absent.  Two threads of
+ * one process can take a fault on the same not-present page at the same
+ * time (the per-thread stacks are per thread, but the heap is shared); with
+ * a plain user_map() the second writer overwrote the first PTE and leaked a
+ * page on every such race.  Returns 1 when the mapping was installed; 0
+ * means somebody else got there first and the caller must free pa.
+ * 仅在 PTE 仍为 absent 时安装 pa。同一进程的两个线程可能同时对同一个未映射页
+ * 缺页（线程栈各一份，但堆是共享的）；用普通 user_map() 时后写者覆盖先写者的
+ * PTE，每次竞争都泄漏一页。安装成功返回 1；返回 0 表示别人先到，调用方须
+ * 释放 pa。
+ */
+static int
+user_map_if_absent(unsigned pdpa, unsigned va, unsigned pa, int prot)
+{
+	unsigned pdi = va >> 22, pti = (va >> 12) & 0x3ff;
+	unsigned *pd, *pt;
+	unsigned ptpa;
+	int i, installed = 0;
+
+	pmap_lock_enter();
+	pd = map_page(SCRATCH_PD, pdpa);
+	if ((pd[pdi] & PG_V) == 0) {
+		ptpa = page_alloc();
+		pt = map_page(SCRATCH_PT, ptpa);
+		for (i = 0; i < PAGE_SIZE / 4; i++)
+			pt[i] = 0;
+		pd[pdi] = ptpa | PG_V | PG_RW | PG_u;
+	} else {
+		pt = map_page(SCRATCH_PT, pd[pdi] & PG_FRAME);
+	}
+	if ((pt[pti] & PG_V) == 0) {
+		pt[pti] = pa | PG_V | PG_u |
+		    ((prot & PROT_WRITE) ? PG_RW : 0);
+		installed = 1;
+	}
+	pmap_lock_exit();
+	return (installed);
 }
 
 /* 中文：解除用户地址 va 的映射：清对应页表项并刷新 TLB，供 munmap 使用 */
@@ -1465,12 +1610,15 @@ static void
 user_unmap(unsigned pdpa, unsigned va)
 {
 	unsigned *pt;
-	unsigned pti = user_pte_ptr(pdpa, va, &pt);
+	unsigned pti;
 
+	pmap_lock_enter();
+	pti = user_pte_ptr(pdpa, va, &pt);
 	if (pt != 0) {
 		pt[pti] = 0;
 		tlbflush();
 	}
+	pmap_lock_exit();
 }
 
 /*
@@ -1677,7 +1825,9 @@ mmap_fault(unsigned va)
 		/* anonymous mapping: zero page on first touch */
 		pa = page_alloc();
 		zero_page(pa);
-		user_map_prot(cur->uk_pd, va, pa, v->prot);
+		/* S431: a concurrent touch of the same page may have won */
+		if (!user_map_if_absent(cur->uk_pd, va, pa, v->prot))
+			page_free(pa);
 		return (1);
 	}
 	pa = pagecache_get(v->vp, idx, &src);
@@ -1695,7 +1845,10 @@ mmap_fault(unsigned va)
 
 		zero_page(pa2);
 		bcopy(src, dst, PAGE_SIZE);
-		user_map_prot(cur->uk_pd, va, pa2, v->prot);
+		/* S431: idempotent install; on a lost race drop our copy but
+		 * still give back the page-cache reference taken above. */
+		if (!user_map_if_absent(cur->uk_pd, va, pa2, v->prot))
+			page_free(pa2);
 		pagecache_unref(v->vp, idx);
 	}
 	return (1);
@@ -1710,19 +1863,34 @@ zcomp_refault(unsigned va)
 	unsigned pti, slot, pa;
 	char *dst;
 
+	/*
+	 * S431: check the compressed PTE and install the new one under the
+	 * pmap lock.  Without it two CPUs faulting the same slot could both
+	 * decompress it and the loser would overwrite the winner's PTE,
+	 * leaking a page and (because zcomp_load() frees the slot) losing the
+	 * data of the mapping that had just been made present.
+	 * 在 pmap 锁内检查压缩 PTE 并安装新 PTE。否则两个 CPU 同时缺页到同一个
+	 * 槽时会各解压一遍，后写者覆盖先写者的 PTE，泄漏一页；而 zcomp_load()
+	 * 已经释放了槽，刚变成 present 的那个映射的数据也随之丢失。
+	 */
+	pmap_lock_enter();
 	pti = user_pte_ptr(cur->uk_pd, va & ~(PAGE_SIZE - 1), &pt);
 	if (pt == 0 || (pt[pti] & PG_V) != 0 ||
-	    (pt[pti] & PG_ZCOMP) == 0)
+	    (pt[pti] & PG_ZCOMP) == 0) {
+		pmap_lock_exit();
 		return (0);
+	}
 	slot = (pt[pti] & PG_FRAME) >> 12;
 	pa = page_alloc();
 	dst = map_page(SCRATCH_PAGE, pa);
 	if (zcomp_load(slot, dst) < 0) {
 		page_put(pa);
 		pt[pti] = 0;
+		pmap_lock_exit();
 		return (0);
 	}
 	pt[pti] = pa | PG_V | PG_RW | PG_u;
+	pmap_lock_exit();
 	hal_address_space_activate(cur->uk_pd);
 	return (1);
 }
@@ -2195,6 +2363,16 @@ zcomp_reclaim(int n)
 	if (in_zcomp || cur == 0)
 		return (0);
 	in_zcomp = 1;
+	/*
+	 * S431: the candidate scan and the PTE rewrite are one critical
+	 * section with the pmap lock, and page_put() inside it can recurse
+	 * back into page_alloc() - which is why pmap_lock is recursive on the
+	 * owning CPU.  in_zcomp still keeps that recursion from looping.
+	 * 候选扫描与 PTE 改写合成一段 pmap 临界区；里面的 page_put() 可能递归回到
+	 * page_alloc()，这正是 pmap_lock 对持有 CPU 可递归的原因。in_zcomp 仍然
+	 * 阻止这种递归无限套下去。
+	 */
+	pmap_lock_enter();
 	pd = map_page(SCRATCH_PD, cur->uk_pd);
 	for (i = 0; i < USER_PDE_LIMIT && n > 0; i++) {
 		unsigned *pt;
@@ -2231,6 +2409,7 @@ zcomp_reclaim(int n)
 		hal_address_space_activate(cur->uk_pd);
 	}
 	in_zcomp = 0;
+	pmap_lock_exit();
 	return (done);
 }
 
@@ -3218,11 +3397,14 @@ extern int vfs_absolutize(const char *, const char *, char *, unsigned);
 static unsigned
 copy_address_space(unsigned srcpd)
 {
-	unsigned dstpd = user_pd_create();
-	unsigned *spd = map_page(SCRATCH_PD, srcpd);
-	unsigned *dpd = map_page(SCRATCH2_PD, dstpd);
+	unsigned dstpd;
+	unsigned *spd, *dpd;
 	int i, j;
 
+	pmap_lock_enter();
+	dstpd = user_pd_create();
+	spd = map_page(SCRATCH_PD, srcpd);
+	dpd = map_page(SCRATCH2_PD, dstpd);
 	for (i = 0; i < USER_PDE_LIMIT; i++) {
 		unsigned *spt, *dpt;
 		unsigned dptpa;
@@ -3249,6 +3431,7 @@ copy_address_space(unsigned srcpd)
 		}
 		dpd[i] = dptpa | (spd[i] & 0xfff);
 	}
+	pmap_lock_exit();
 	return (dstpd);
 }
 
@@ -3264,11 +3447,25 @@ copy_address_space(unsigned srcpd)
 static unsigned
 copy_address_space_cow(unsigned srcpd)
 {
-	unsigned dstpd = user_pd_create();
-	unsigned *spd = map_page(SCRATCH_PD, srcpd);
-	unsigned *dpd = map_page(SCRATCH2_PD, dstpd);
+	unsigned dstpd;
+	unsigned *spd, *dpd;
 	int i, j;
 
+	/*
+	 * S431: this loop *writes the parent's PTEs* (clears PG_RW, sets
+	 * PG_COW) while the parent may be running on another CPU, and the
+	 * refcount bump it pairs with must be atomic.  Both happen under the
+	 * pmap lock, so a concurrent fault on the parent either sees the page
+	 * still writable (and does nothing) or sees PG_COW (and copies).
+	 * 这段循环**修改父进程的 PTE**（清 PG_RW、置 PG_COW），而父进程可能正在
+	 * 另一个 CPU 上跑；与之配对的引用计数自增也必须是原子的。两者都在 pmap
+	 * 锁内完成，因此父进程的并发缺页要么看到页仍可写（什么都不做），要么看到
+	 * PG_COW（去复制）。
+	 */
+	pmap_lock_enter();
+	dstpd = user_pd_create();
+	spd = map_page(SCRATCH_PD, srcpd);
+	dpd = map_page(SCRATCH2_PD, dstpd);
 	for (i = 0; i < USER_PDE_LIMIT; i++) {
 		unsigned *spt, *dpt;
 		unsigned dptpa;
@@ -3296,6 +3493,7 @@ copy_address_space_cow(unsigned srcpd)
 		}
 		dpd[i] = dptpa | (spd[i] & 0xfff);
 	}
+	pmap_lock_exit();
 	return (dstpd);
 }
 
@@ -3328,7 +3526,10 @@ demand_page(unsigned va)
 		return (0);
 	pa = page_alloc();
 	zero_page(pa);
-	user_map(cur->uk_pd, page, pa);
+	if (!user_map_if_absent(cur->uk_pd, page, pa,
+	    PROT_READ | PROT_WRITE)) {
+		page_free(pa);		/* S431: lost a race, drop our copy */
+	}
 	hal_address_space_activate(cur->uk_pd);
 	return (1);
 }
@@ -3383,9 +3584,23 @@ user_page_fault_locked(unsigned va, unsigned err)
 		    mmap_fault(va & ~(PAGE_SIZE - 1)));
 	if ((err & 7) != 7)		/* present + write + user */
 		return (0);
+	/*
+	 * S431: read the COW PTE, take ownership and install the result as
+	 * one pmap critical section.  Two threads of the same process faulting
+	 * on one shared page used to be serialized by the BKL; with the pmap
+	 * lock the loser now sees a PTE that is already writable and private
+	 * and simply returns, instead of copying the page a second time and
+	 * overwriting the winner's mapping.
+	 * 把"读 COW PTE、取得所有权、写回结果"合成一段 pmap 临界区。同一进程的两个
+	 * 线程对同一个共享页缺页原本靠 BKL 串行；现在后到者会看到 PTE 已经私有且
+	 * 可写，直接返回，不会再复制一次并覆盖先到者的映射。
+	 */
+	pmap_lock_enter();
 	pti = user_pte_ptr(cur->uk_pd, va & ~(PAGE_SIZE - 1), &pt);
-	if (pt == 0 || (pt[pti] & PG_V) == 0 || (pt[pti] & PG_COW) == 0)
+	if (pt == 0 || (pt[pti] & PG_V) == 0 || (pt[pti] & PG_COW) == 0) {
+		pmap_lock_exit();
 		return (0);
+	}
 	pa = pt[pti] & PG_FRAME;
 	cow_faults++;
 	if (page_ref_get(pa) <= 1) {
@@ -3400,6 +3615,7 @@ user_page_fault_locked(unsigned va, unsigned err)
 		pt[pti] = npa | PG_V | PG_RW | PG_u;
 		cow_copies++;
 	}
+	pmap_lock_exit();
 	hal_address_space_activate(cur->uk_pd);
 	return (1);
 }

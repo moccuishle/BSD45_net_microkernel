@@ -335,6 +335,42 @@ zcomp 状态，这些都还没有自己的锁。**因此缺页路径在 pmap/COW
 加锁后再放系统调用入口。
 
 
+### 6.2.3 pmap 锁 + COW 引用计数 + zcomp 锁（S431，路线图第 ① ② 步）
+
+S430 只把页分配器摘出 BKL。S431 补齐缺页路径另外两块共享状态，仍**不**把缺页
+移出 BKL（第 ③ 步）——理由是 S430 的失败已经证明：没有 ② 就动 ③ 必炸。
+
+- **`pmap_lock`（用户页表锁）**：一把全局自旋锁，覆盖"写用户页目录 / 页表 /
+  PTE"以及随之而来的页表页分配。覆盖点：`user_pd_create`、`user_map`、
+  `user_map_prot`、`user_unmap`、`free_address_space`、`copy_address_space`、
+  `copy_address_space_cow`（这段会改**父进程**的 PTE：清 RW、置 COW）、
+  `zcomp_refault`、`zcomp_reclaim`、缺页的 COW 分支。
+  为什么不按地址空间分锁：fork 一边拷父进程、一边让子进程 CR3 生效，同一时刻
+  会碰两个地址空间；热点又只是一条 PTE 存储。分锁只多一次查找。
+- **对持有 CPU 递归**：`user_map()` 在编辑中途要 `page_alloc()` 一个页表页，
+  `page_alloc()` 可能进 `zcomp_reclaim()`，而回收恰好遍历调用方正改的页表。
+  递归（`pmap_owner/pmap_depth` 记持有 CPU）让这种重入无害：同一 CPU、同一段
+  编辑、不取第二把锁。锁序 `pmap_lock → page_lock`、`pmap_lock → zcomp 锁`，
+  没有反向路径（这也正是 S430 里 `page_lock` 必须"pop 完就放"的原因）。
+- **COW 引用计数改原子**：`page_ref_inc/page_put` 原来是 `load/add/store`，
+  两个 CPU 各加一次会丢一次自增，`page_put()` 于是释放别人还在映射的页。
+  现在统一走 `page_ref_add()`（`lock; xaddw`），返回旧值供"我是不是最后一个"
+  判断；`page_put()` 用旧值决定"只递减"还是"清零 + 放回空闲链表"。
+- **zcomp 自锁**：槽位池、统计和那个 2 KB 的 `zwork` 编码缓冲原来是全局单写者。
+  现在 `zcomp_store/load/free_slot` 各自取 `zc_lock`，两个 CPU 同时压缩不会把
+  彼此的游程编码搅在一起。
+- **`in_fault` 改每 CPU**：原来是全局标志——A 核缺页会让 B 核的缺页也失去
+  "不要回收"的保护，更糟的是 B 核退出时清标志会把 A 核的保护一起取消。
+  现在是 `in_fault_cpu[MAXCPU]`，`#define in_fault in_fault_cpu[cpu_id()]`。
+- **`user_map_if_absent()`**：同一进程两个线程可能对同一个未映射页同时缺页
+  （线程栈各一份、堆共享）。原来后写者覆盖先写者的 PTE，每次竞争泄漏一页；
+  现在"PTE 仍 absent 才安装"，输的一方 `page_free()` 自己的副本。
+
+**仍然没做的**：缺页与系统调用整体还在 BKL 内（第 ③ 步）。要再往前一步，需要
+先把 VFS/pagecache/pipe/fd 表按子系统加锁（第 ④ 步），或者把缺页的 CR3 归属
+判定做成"错了就放弃、回到 BKL 路径重试"的机制——S430 试过一次，失败在
+triple fault，而不是锁本身。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端

@@ -2,6 +2,7 @@
 # run_qemu_test.sh - boot the BSD45 ISO in QEMU and drive the serial console.
 #
 #   run_qemu_test.sh -Keys "shell|ls /|exit 0" -WaitFor "user exit"
+#   run_qemu_test.sh -Smp 8 -Mem 3072 -Keys "shell|/bin/pthread|exit 0"
 #
 # The serial port is a TCP server; bash's /dev/tcp is used as the client, so
 # no extra tooling is needed.
@@ -15,6 +16,7 @@ waitfor="user exit"
 timeout=30
 log_out=""
 port="${SERIAL_PORT:-$((5700 + RANDOM % 200))}"
+smp="${SMP:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -23,6 +25,8 @@ while [ $# -gt 0 ]; do
         -WaitFor)    waitfor="$2"; shift 2 ;;
         -TimeoutSec) timeout="$2"; shift 2 ;;
         -Log)        log_out="$2"; shift 2 ;;
+        -Smp)        smp="$2"; shift 2 ;;
+        -Mem)        MEM_MB="$2"; shift 2 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -33,7 +37,9 @@ qemu="$(find_qemu)" || { echo "qemu-system-i386 not found" >&2; exit 1; }
 log="$(mktemp)"
 trap 'rm -f "$log"; [ -n "${qpid:-}" ] && kill "$qpid" 2>/dev/null' EXIT
 
-"$qemu" -cdrom "$iso" -boot d -m ${MEM_MB:-128} -display none -no-reboot \
+smp_arg=()
+[ "$smp" -gt 1 ] 2>/dev/null && smp_arg=(-smp "$smp")
+"$qemu" -cdrom "$iso" -boot d -m ${MEM_MB:-128} "${smp_arg[@]}" -display none -no-reboot \
     -serial "tcp:127.0.0.1:$port,server=on,wait=on" -monitor none &
 qpid=$!
 

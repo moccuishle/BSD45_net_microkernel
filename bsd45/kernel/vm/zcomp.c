@@ -14,6 +14,7 @@
  */
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/smp.h>
 
 #include <vm/vm.h>
 #include <vm/vm_page.h>
@@ -33,6 +34,16 @@ struct zslot {
 	int		 z_used;
 };
 
+/*
+ * S431: the slot pool, the RLE work buffer and the statistics used to rely on
+ * the BKL.  The page allocator can now call zcomp_reclaim() from a fault on
+ * any CPU, so they have their own lock; zwork is a single 2 KB buffer and two
+ * CPUs compressing at once would have interleaved their encodings.
+ * 槽位池、RLE 工作缓冲和统计原来依赖 BKL。现在页分配器可以在任意 CPU 的缺页
+ * 路径里调用 zcomp_reclaim()，所以它们有了自己的锁；zwork 只有一份 2KB，
+ * 两个 CPU 同时压缩会把彼此的编码搅在一起。
+ */
+static struct spinlock	zc_lock;
 static struct zslot	zslots[ZCOMP_SLOT_COUNT];
 static unsigned char	*zpool_va;	/* ZCOMP_VA */
 static unsigned	char	zwork[ZCOMP_SLOT_SIZE];
@@ -106,6 +117,7 @@ zcomp_init(void)
 	unsigned i, pa;
 	unsigned char *p;
 
+	spin_init(&zc_lock);
 	bzero(zslots, sizeof(zslots));
 	z_compressed = z_decompressed = z_saved = 0;
 	z_rejected = z_full = 0;
@@ -135,6 +147,7 @@ zcomp_store(const unsigned char *src, unsigned *slotp, unsigned *lenp)
 
 	if (!zcomp_ready)
 		return (-1);
+	spin_lock(&zc_lock);
 	for (i = 0; i < PAGE_SIZE; i++)
 		if (src[i] != 0) {
 			allzero = 0;
@@ -145,10 +158,12 @@ zcomp_store(const unsigned char *src, unsigned *slotp, unsigned *lenp)
 		*lenp = 0;
 		z_compressed++;
 		z_saved += PAGE_SIZE;
+		spin_unlock(&zc_lock);
 		return (0);
 	}
 	if (zcomp_rle(src, zwork, &len) < 0) {
 		z_rejected++;
+		spin_unlock(&zc_lock);
 		return (-1);
 	}
 	for (i = 1; i < ZCOMP_SLOT_COUNT; i++)
@@ -156,6 +171,7 @@ zcomp_store(const unsigned char *src, unsigned *slotp, unsigned *lenp)
 			break;
 	if (i >= ZCOMP_SLOT_COUNT) {
 		z_full++;
+		spin_unlock(&zc_lock);
 		return (-1);
 	}
 	bcopy(zwork, zslots[i].z_data, len);
@@ -165,6 +181,7 @@ zcomp_store(const unsigned char *src, unsigned *slotp, unsigned *lenp)
 	*lenp = len;
 	z_compressed++;
 	z_saved += PAGE_SIZE - len;
+	spin_unlock(&zc_lock);
 	return (0);
 }
 
@@ -177,20 +194,26 @@ zcomp_load(unsigned slot, unsigned char *dst)
 
 	if (!zcomp_ready || slot >= ZCOMP_SLOT_COUNT)
 		return (-1);
+	spin_lock(&zc_lock);
 	if (slot == ZCOMP_SLOT_ZERO) {
 		for (i = 0; i < PAGE_SIZE; i++)
 			dst[i] = 0;
 		z_decompressed++;
+		spin_unlock(&zc_lock);
 		return (0);
 	}
-	if (!zslots[slot].z_used)
+	if (!zslots[slot].z_used) {
+		spin_unlock(&zc_lock);
 		return (-1);
+	}
 	if (zcomp_unrle(zslots[slot].z_data, zslots[slot].z_len, dst) < 0) {
 		zslots[slot].z_used = 0;
+		spin_unlock(&zc_lock);
 		return (-1);
 	}
 	zslots[slot].z_used = 0;
 	z_decompressed++;
+	spin_unlock(&zc_lock);
 	return (0);
 }
 
@@ -200,8 +223,11 @@ void
 zcomp_free_slot(unsigned slot)
 {
 
-	if (slot > 0 && slot < ZCOMP_SLOT_COUNT)
+	if (slot > 0 && slot < ZCOMP_SLOT_COUNT) {
+		spin_lock(&zc_lock);
 		zslots[slot].z_used = 0;
+		spin_unlock(&zc_lock);
+	}
 }
 
 /* 中文：输出压缩池的各项统计值（压缩/解压次数、节省字节、拒绝次数、池满次数） */

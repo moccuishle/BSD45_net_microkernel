@@ -45,6 +45,11 @@ DT_DIR=4
 DT_REG=8
 
 # ------------------------------------------------------------ hex utilities
+# A pool of '0' digits for padding (builtin only, brace expansion is shell
+# side).  `printf '0%.0s' $(seq 1 N)` used to fork seq+printf per call, which
+# costs half a second on MSYS2.
+printf -v ZEROS '%0.s0' {1..16384}
+
 # Reverse the byte order of an even-length hex string.
 rev_hex_bytes() {
     local h="$1" out="" i
@@ -55,19 +60,29 @@ rev_hex_bytes() {
 }
 
 # Little-endian hex representation of integer $1 using $2 bytes.
+#
+# Everything here is a shell builtin (printf -v, arithmetic expansion).  The
+# first version built the string with $(printf ...) + $(rev_hex_bytes ...),
+# i.e. two forks per call; with a 1024-entry indirect block the cylinder-group
+# scan calls it >100k times and the image build took over ten minutes on MSYS2
+# (where fork costs milliseconds) while a native Linux bash did it in seconds.
+# No forks now: the same image is produced in a couple of seconds everywhere.
 le_hex() {
-    local v="$1" n="$2" h
-    h=$(printf "%0$((n * 2))x" "$v")
-    rev_hex_bytes "$h"
+    local v="$1" n="$2" i b out=""
+    for ((i = 0; i < n; i++)); do
+        printf -v b '%02x' "$(( (v >> (8 * i)) & 0xff ))"
+        out+="$b"
+    done
+    printf -v LE '%s' "$out"
 }
 
 # Set an n-byte little-endian integer at byte offset $2 in hex buffer named $1.
 hex_set_le() {
     local -n _buf="$1"
     local off="$2" val="$3" n="${4:-4}"
-    local hv pos=$((off * 2))
-    hv=$(le_hex "$val" "$n")
-    _buf="${_buf:0:$pos}${hv}${_buf:$((pos + ${#hv}))}"
+    local pos=$((off * 2))
+    le_hex "$val" "$n"
+    _buf="${_buf:0:$pos}${LE}${_buf:$((pos + ${#LE}))}"
 }
 
 # Set raw hex bytes at byte offset $2 in hex buffer named $1.
@@ -86,19 +101,31 @@ write_hex_buf() {
 }
 
 # Read an n-byte little-endian integer from a hex string at byte offset.
+# The result is left in HEXV ($(...) around this function would fork).
 hex_get_le() {
-    local h="$1" off="$2" n="${3:-4}"
-    local hb="${h:$((off * 2)):$((n * 2))}"
-    printf '%d' "$((16#$(rev_hex_bytes "$hb")))"
+    local h="$1" off="$2" n="${3:-4}" i b
+    # NB: pos must be computed after `local` has run - the whole word list of a
+    # builtin is expanded before the builtin executes, so `local x=$2 pos=$((x*2))`
+    # would read an unset x (set -u: "off: unbound variable").
+    local pos=$(( off * 2 ))
+    local v=0
+    for ((i = n - 1; i >= 0; i--)); do
+        printf -v b '%d' "$((16#${h:$((pos + i * 2)):2}))"
+        v=$(( (v << 8) | b ))
+    done
+    HEXV=$v
 }
 
 # Set one bit in an in-memory hex buffer (named by $1).
+# printf -v instead of $(printf ...): the cylinder-group builder calls this
+# once per allocated fragment, and the fork made it the other slow loop.
 hex_set_bit() {
     local -n _buf="$1"
     local byte="$2" bit="$3"
-    local pos=$((byte * 2))
-    local cur=$((16#${_buf:$pos:2}))
-    _buf="${_buf:0:$pos}$(printf '%02x' $((cur | (1 << bit))))${_buf:$((pos + 2))}"
+    local pos=$((byte * 2)) cur hx
+    printf -v cur '%d' "$((16#${_buf:$pos:2}))"
+    printf -v hx '%02x' "$((cur | (1 << bit)))"
+    _buf="${_buf:0:$pos}${hx}${_buf:$((pos + 2))}"
 }
 
 # ------------------------------------------------------------- arg parsing
@@ -341,17 +368,32 @@ for ((i = 0; i < NNODE; i++)); do
 done
 
 # ---------------------------------------------------------- one struct direct
+# A name is encoded with the printf builtin instead of `xxd -p | tr -d`:
+# every external process costs a quarter of a second on MSYS2 (no fork(2)),
+# and this runs once per directory entry.
+str_hex() {   # sets HEXS
+    local s="$1" i h out=""
+    for ((i = 0; i < ${#s}; i++)); do
+        printf -v h '%02x' "'${s:i:1}"
+        out+="$h"
+    done
+    HEXS=$out
+}
+
 dirent_hex() {
     local ino="$1" dt="$2" name="$3"
     local nl=${#name}
     local rl=$(( (8 + nl + 1 + 3) & ~3 ))
-    local hdr nh pad padlen
-    hdr="$(le_hex "$ino" 4)$(le_hex "$rl" 2)$(printf '%02x' "$dt")$(printf '%02x' "$nl")"
-    nh=$(printf '%s' "$name" | xxd -p | tr -d '\n')
+    local hdr hx nh pad padlen
+    le_hex "$ino" 4; hdr="$LE"
+    le_hex "$rl" 2; hdr+="$LE"
+    printf -v hx '%02x' "$dt"; hdr+="$hx"
+    printf -v hx '%02x' "$nl"; hdr+="$hx"
+    str_hex "$name"; nh="$HEXS"
     padlen=$((rl - 8 - nl))
     pad=""
     if ((padlen > 0)); then
-        pad=$(printf '00%.0s' $(seq 1 "$padlen"))
+        pad=${ZEROS:0:$((padlen * 2))}
     fi
     printf '%s%s%s' "$hdr" "$nh" "$pad"
 }
@@ -395,21 +437,23 @@ for ((i = 0; i < NNODE; i++)); do
     read -ra ptrs <<< "${NODE_INDIRECT[$i]}"
     arrhex=""
     for ((j = 0; j < ${#ptrs[@]} && j < NINDIR; j++)); do
-        arrhex+="$(le_hex "${ptrs[j]}" 4)"
+        le_hex "${ptrs[j]}" 4
+        arrhex+="$LE"
     done
     need=$((BSIZE * 2 - ${#arrhex}))
     if ((need > 0)); then
-        arrhex+="$(printf '0%.0s' $(seq 1 "$need"))"
+        arrhex+=${ZEROS:0:$need}
     fi
     write_hex_buf "$arrhex" "$((ifr * DEV_BSIZE))" "$OUT"
 done
 
 # ------------------------------------------------------------ write file data
-write_chunk() {
-    local src="$1" bidx="$2" blk="$3" sz="$4"
-    local off=$((bidx * BSIZE)) len=$BSIZE rem
+# write_run <src> <first chunk index> <first frag> <chunks> <file size>
+# A run of consecutive fragments and consecutive source chunks is one dd.
+write_run() {
+    local src="$1" bidx="$2" blk="$3" nb="$4" sz="$5"
+    local off=$((bidx * BSIZE)) len=$((nb * BSIZE)) rem
     rem=$((sz - off))
-    ((rem < 0)) && rem=0
     ((len > rem)) && len=$rem
     ((len <= 0)) && return 0
     dd if="$src" of="$OUT" bs="$len" \
@@ -425,22 +469,27 @@ for ((i = 0; i < NNODE; i++)); do
     declare -a direct=() indirect=()
     read -ra direct <<< "${NODE_DIRECT[i]}"
     read -ra indirect <<< "${NODE_INDIRECT[i]}"
-    bidx=0
-    for blk in "${direct[@]}"; do
-        write_chunk "$src" "$bidx" "$blk" "$sz"
+    # Coalesce consecutive blocks: one dd per run instead of one per 4 KB.
+    # sh.elf is ~170 blocks, and a process spawn costs 0.25-0.5 s on MSYS2.
+    blist=("${direct[@]}" "${indirect[@]}")
+    bidx=0 run_start=0 run_blk=-1 run_n=0
+    for blk in "${blist[@]}"; do
+        if (( run_n > 0 && blk == run_blk + run_n * FRAG )); then
+            run_n=$((run_n + 1))
+        else
+            (( run_n > 0 )) && write_run "$src" "$run_start" "$run_blk" "$run_n" "$sz"
+            run_start=$bidx; run_blk=$blk; run_n=1
+        fi
         bidx=$((bidx + 1))
     done
-    for blk in "${indirect[@]}"; do
-        write_chunk "$src" "$bidx" "$blk" "$sz"
-        bidx=$((bidx + 1))
-    done
+    (( run_n > 0 )) && write_run "$src" "$run_start" "$run_blk" "$run_n" "$sz"
 done
 
 # ------------------------------------------------------- build one struct dinode
 build_dinode_hex() {
     local i="$1"
     local DIN
-    DIN=$(printf '0%.0s' $(seq 1 256))    # 128 bytes = 256 hex chars
+    printf -v DIN '%0.s0' {1..256}       # 128 bytes = 256 hex chars
     local mode nlink size nblocks
     if [[ "${NODE_TYPE[i]}" == "d" ]]; then
         mode=$((040000 | 0755))
@@ -480,16 +529,24 @@ build_dinode_hex() {
 
     hex_set_le DIN 104 "$nblocks" 4  # di_blocks
     hex_set_le DIN 108 1 4           # di_gen
-    printf '%s' "$DIN"
+    DINO=$DIN                        # caller-side variable: no $(...) fork
 }
 
 # ----------------------------------------------------------- write inode table
+# The whole table goes out in one write: one dd/xxd pair instead of one per
+# inode (each external process is ~0.25 s on MSYS2, where there is no fork).
+ITABZ=""
+ITABLEN=$((ipg * INOSIZE * 2))          # hex characters
+while (( ${#ITABZ} < ITABLEN )); do ITABZ+=$ZEROS; done
+ITAB=${ITABZ:0:$ITABLEN}
 for ((i = 0; i < NNODE; i++)); do
     ino=${NODE_INO[$i]}
     if ((ino <= 0 || ino > ipg)); then continue; fi
-    off=$((iblkno * DEV_BSIZE + (ino - 1) * INOSIZE))
-    write_hex_buf "$(build_dinode_hex "$i")" "$off" "$OUT"
+    build_dinode_hex "$i"
+    pos=$(( (ino - 1) * INOSIZE * 2 ))
+    ITAB="${ITAB:0:$pos}${DINO}${ITAB:$((pos + INOSIZE * 2))}"
 done
+write_hex_buf "$ITAB" "$((iblkno * DEV_BSIZE))" "$OUT"
 
 # ------------------------------------------------------------- superblock
 ndir=0
@@ -498,7 +555,7 @@ for ((i = 0; i < NNODE; i++)); do
 done
 nifree=$((ipg - NNODE))
 
-SB=$(printf '0%.0s' $(seq 1 16384))    # 8192 bytes
+printf -v SB '%0.s0' {1..16384}         # 8192 bytes
 sblkno=$((8192 / DEV_BSIZE))            # 16
 cblkno=$((sblkno + 8192 / BSIZE))       # 18
 
@@ -571,30 +628,29 @@ CG_MAGIC=$((0x4a4c4653))
 CG_INOMAP=64
 CG_FRAGMAP=128
 IFMT=$((0170000))
-CG=$(printf '0%.0s' $(seq 1 8192))    # 4096 bytes as hex
+printf -v CG '%0.s0' {1..8192}          # 4096 bytes as hex
 hex_set_le CG 0 "$CG_MAGIC" 4
 for ((f = 0; f < dblkno; f++)); do
     hex_set_bit CG "$((CG_FRAGMAP + f / 8))" "$((f % 8))"
 done
 hex_set_bit CG "$CG_INOMAP" 0         # inode 1 reserved
 for ((ino = 2; ino <= ipg; ino++)); do
-    off=$((iblkno * DEV_BSIZE + (ino - 1) * INOSIZE))
-    din=$(dd if="$OUT" bs=1 skip="$off" count="$INOSIZE" status=none | xxd -p -c "$INOSIZE" | tr -d '\n')
-    mode=$(hex_get_le "$din" 0 2)
+    din=${ITAB:$(( (ino - 1) * INOSIZE * 2 )):$((INOSIZE * 2))}
+    hex_get_le "$din" 0 2; mode=$HEXV
     (((mode & IFMT) == 0)) && continue
     hex_set_bit CG "$((CG_INOMAP + (ino - 1) / 8))" "$(((ino - 1) % 8))"
     for ((j = 0; j < 12; j++)); do
-        frag=$(hex_get_le "$din" $((40 + j * 4)) 4)
+        hex_get_le "$din" $((40 + j * 4)) 4; frag=$HEXV
         if ((frag >= dblkno && frag < total_frags)); then
             hex_set_bit CG "$((CG_FRAGMAP + frag / 8))" "$((frag % 8))"
         fi
     done
-    indir=$(hex_get_le "$din" 88 4)
+    hex_get_le "$din" 88 4; indir=$HEXV
     if ((indir >= dblkno && indir < total_frags)); then
         hex_set_bit CG "$((CG_FRAGMAP + indir / 8))" "$((indir % 8))"
         ib=$(dd if="$OUT" bs=1 skip="$((indir * DEV_BSIZE))" count="$BSIZE" status=none | xxd -p -c "$BSIZE" | tr -d '\n')
         for ((j = 0; j < NINDIR; j++)); do
-            frag=$(hex_get_le "$ib" $((j * 4)) 4)
+            hex_get_le "$ib" $((j * 4)) 4; frag=$HEXV
             if ((frag >= dblkno && frag < total_frags)); then
                 hex_set_bit CG "$((CG_FRAGMAP + frag / 8))" "$((frag % 8))"
             fi
