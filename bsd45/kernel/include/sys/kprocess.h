@@ -211,6 +211,14 @@ struct	process {
 	struct kthread	*uk_p_thread;	/* running thread of this process */
 	struct kthread	*uk_p_threads;	/* head of this process's KLT list */
 	int		uk_p_nthreads;
+	/* S425: proc_exit() could not quiesce a CPU that still had this
+	 * address space loaded, so the page directory was deliberately not
+	 * returned to the allocator (leaked, with a warning) instead of
+	 * handing a live CPU a freed page table. */
+	int		uk_pd_pinned;
+	/* S425: the main thread exited before its siblings; uk_exitcode
+	 * already holds the status the process must finally report. */
+	int		uk_p_maingone;
 	int		uk_p_next_tid;
 	int		uk_aio_wait_token;
 	int		uk_uring_wait;

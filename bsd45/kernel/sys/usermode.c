@@ -278,6 +278,16 @@ static int	ps_snap_len;
  * 不能是空闲的；此时它还没有 TCB，所以任何调度扫描都碰不到它。
  */
 #define	P_ALLOC		5
+/*
+ * S425: the process is tearing itself down.  It must not be scheduled, not
+ * be reaped by wait4() and not be picked up by a second proc_exit() while
+ * the address space is being quiesced - proc_exit() has to drop the BKL for
+ * that wait (a sibling can be spinning in smp_bkl_enter() with our CR3
+ * loaded), so other CPUs really do run in the middle of it.
+ * S425：进程正在拆除。此时不能被调度、不能被 wait4 回收、也不能被第二个
+ * proc_exit 重入——拆除期间要放掉 BKL 等其它核离开本地址空间。
+ */
+#define	P_EXITING	6
 
 /*
  * Signal numbers / defaults.  These are the 4.5BSD values; only the ones we
@@ -367,6 +377,18 @@ struct sched_cpu {
 	unsigned	sc_cur_pd;	/* page directory currently in CR3 */
 	int		sc_need_resched;/* safe-point reschedule request */
 	struct kthread	*sc_idle;	/* this CPU's scheduler carrier */
+	/*
+	 * S424: the TCB this CPU switched away from and must release once it
+	 * is certain it is no longer executing on that kernel stack.  t_oncpu
+	 * is a stack mutex, not affinity: holding it after the switch pins
+	 * the thread to this CPU for its whole life, so an idle CPU cannot
+	 * pick up work that this (busy) CPU has queued behind a running
+	 * thread.  The release happens on the next scheduler entry, by which
+	 * time this CPU runs on a different stack.
+	 */
+	struct kthread	*sc_prev;
+	unsigned	sc_tick;	/* S424: per-CPU tick counter (aging cadence) */
+	int		sc_parked;	/* S424: parked in hlt with nothing to run */
 	int		sc_online;
 	unsigned	sc_switches;	/* context switches done here */
 };
@@ -381,6 +403,62 @@ static int		idle_reported;
 #define	cur_thread	(sched_cpu[cpu_id()].sc_curthread)
 #define	cur_pd		(sched_cpu[cpu_id()].sc_cur_pd)
 #define	need_resched	(sched_cpu[cpu_id()].sc_need_resched)
+
+/*
+ * S424: give up the TCB this CPU switched away from.
+ *
+ * t_oncpu started as "this CPU may still be executing on that TCB's kernel
+ * stack", which is what keeps two CPUs out of one stack.  It was never
+ * released on a plain context switch, so it silently became a hard affinity:
+ * a thread that once ran on CPU 3 could only ever be resumed by CPU 3, and
+ * the other CPUs skipped it in fair_pick_next() and went back to hlt even
+ * while it sat runnable.  Releasing it here keeps the mutex semantics (we
+ * only do it once this CPU is demonstrably on a different stack) and lets an
+ * idle CPU pick the thread up.
+ */
+static void	sched_wake_idle(void);
+
+static void
+sched_release_prev(void)
+{
+	int id = cpu_id();
+	struct kthread *prev = sched_cpu[id].sc_prev;
+
+	if (prev == 0)
+		return;
+	if (prev == cur_thread)
+		return;			/* we are back on that very stack */
+	sched_cpu[id].sc_prev = 0;
+	kthread_release_cpu(prev);
+	/*
+	 * S424: if the thread we just released is still runnable, an idle
+	 * CPU can take it - but an idle CPU sits in hlt and only looks again
+	 * on its next tick, by which time this CPU has usually re-claimed
+	 * the thread.  Nudge one idle CPU so the work actually spreads
+	 * instead of ping-ponging on a single core.
+	 */
+	if (prev->t_state == KT_RUN)
+		sched_wake_idle();
+}
+
+/*
+ * S424: wake one CPU that is parked in the idle loop, so it can claim a
+ * runnable thread instead of waiting up to a full tick.  Called only on
+ * transitions where a thread became available, never per tick.
+ */
+static void
+sched_wake_idle(void)
+{
+	int i, id = cpu_id();
+
+	for (i = 0; i < MAXCPU; i++) {
+		if (i == id || !sched_cpu[i].sc_online || !sched_cpu[i].sc_parked)
+			continue;
+		smp_resched_cpu(i);
+		return;
+	}
+}
+
 /*
  * S411: user VA layout, derived from the boot memory plan instead of the
  * old fixed 48 MB heap / 512 MB mmap constants.  Defaults match a 128 MB
@@ -455,6 +533,13 @@ proc_wake(struct process *p)
 	int i;
 
 	if (p == 0)
+		return;
+	/*
+	 * S425: never resurrect a process that is in the middle of proc_exit()
+	 * (the teardown drops the BKL while it waits for other CPUs, so a
+	 * concurrent wakeup really can land here) or one that is already gone.
+	 */
+	if (p->uk_state == P_FREE || p->uk_state == P_EXITING)
 		return;
 	p->uk_state = P_RUN;
 	for (i = 0; i < nkthread; i++) {
@@ -597,6 +682,8 @@ kern_table_alloc(unsigned va, unsigned size)
 }
 
 static void sig_deliver(struct process *, struct sysregs *);
+/* S424: the single thread-selection policy (defined with sched_tick below). */
+static struct kthread *fair_pick_next(struct kthread *me);
 static int console_fg_pgrp;
 
 static unsigned page_free_list;
@@ -3308,7 +3395,6 @@ proc_sched(void)
 	struct process *me = cur;
 	struct kthread *mt;
 	int cid = cpu_id();
-	int i;
 
 	/*
 	 * S417: keep the "thread that called the scheduler" in a per-CPU
@@ -3372,6 +3458,11 @@ proc_sched(void)
 		 */
 		smp_bkl_drop();
 		/*
+		 * S424: drop the ownership of the TCB this CPU left last time
+		 * round, so it can migrate to an idle CPU.
+		 */
+		sched_release_prev();
+		/*
 		 * S413: publish TCB slots whose owner threads have already left
 		 * their stacks (see kthread_reap).  `mt` is the stack this CPU
 		 * is on, so its own slot is never recycled under its feet.
@@ -3387,86 +3478,80 @@ proc_sched(void)
 		 * user thread names its address-space container through
 		 * t_proc; run state still lives on the process for now.
 		 */
-		for (i = 0; i < nkthread; i++) {
-			struct kthread *t = &kthreads[i];
+		/*
+		 * S424: ONE selection policy for the whole scheduler.  This
+		 * loop used to dispatch the first claimable KT_RUN slot in
+		 * table order - i.e. "lowest TCB index wins" - while
+		 * sched_tick() used fair_pick_next() (effective priority,
+		 * then estcpu, then SMT affinity).  So a CPU-bound thread in
+		 * a low slot took the CPU at every voluntary switch point
+		 * (block/exit/syscall) and the priority decision only ever
+		 * applied on timer ticks.  fair_pick_next() already filters
+		 * with tcb_runnable(), which carries the same process-state
+		 * rules this loop used to duplicate.
+		 *
+		 * S413: with AP user dispatch switched off, an AP keeps its
+		 * LAPIC/IPI path alive but never runs user threads; `smpuser`
+		 * toggles this at runtime.
+		 */
+		if (cid == 0 || smp_user_dispatch) {
+			struct kthread *t = fair_pick_next(mt);
 			struct process *p;
 			struct sysregs *regs;
 			int main_thread;
 
 			/*
-			 * S413: with AP user dispatch switched off, an AP keeps
-			 * its LAPIC/IPI path alive but never runs user threads;
-			 * the BSP stays the only scheduler, exactly like the
-			 * pre-S413 build.  `smpuser` toggles this at runtime.
+			 * S413: the claim is the SMP-critical part.  It fails
+			 * when another CPU already owns the TCB (which is how
+			 * N CPUs share one table without running a thread
+			 * twice or sharing its kernel stack) - and it can fail
+			 * for a thread fair_pick_next() just chose, because
+			 * another CPU may have claimed it in the meantime.
 			 */
-			if (cid != 0 && !smp_user_dispatch)
-				break;
-			/* KLT runnable decision: per-TCB state, plus a single-
-			 * threaded process may be blocked as a whole (classic
-			 * wait/pipe semantics).  A multi-threaded process stays
-			 * P_RUN while one TCB blocks, so siblings keep running. */
-			if (!t->t_used || t->t_proc == 0 || t == mt)
-				continue;
-			if (t->t_state != KT_RUN)
-				continue;
-			/*
-			 * S413: the claim is the SMP-critical part.  It
-			 * fails when another CPU already owns the TCB, which
-			 * is how N CPUs walk the same table without ever
-			 * running one thread twice (or sharing its kernel
-			 * stack).  A thread stays owned by its CPU until it
-			 * exits, so this is a placement rule, not a lock.
-			 */
-			if (!kthread_claim_cpu(t, cid))
-				continue;
-			p = t->t_proc;
-			if (p->uk_state == P_FREE || p->uk_state == P_ZOMBIE ||
-			    p->uk_state == P_ALLOC) {
+			if (t != 0 && kthread_claim_cpu(t, cid)) {
+				p = t->t_proc;
+				main_thread = (t->t_tid == p->uk_pid);
+				regs = main_thread ? &p->uk_regs : &t->t_regs;
+				cur = p;
+				cur_thread = t;
+				cpus[cid].ci_curthread = t;
+				t->t_want_cpu = cid;	/* S424: affinity hint */
 				/*
-				 * S413: only give up a claim we actually own.
-				 * The old code called kthread_release_cpu()
-				 * unconditionally here, so a CPU scanning a
-				 * blocked thread revoked *another* CPU's
-				 * ownership - which is how an AP ended up
-				 * dispatching the shell that the BSP was
-				 * waiting on.
+				 * S424: a dispatched thread starts a fresh
+				 * quantum.  sched_on_tick() only increments
+				 * t_ticks and the preemption test is
+				 * "t_ticks >= t_quantum", so without this
+				 * reset a thread that once exhausted its
+				 * quantum stayed "expired" forever and every
+				 * tick switched it out - disabling
+				 * QUANTUM_IO/QUANTUM_CPU and turning the
+				 * scheduler into a fixed 1-tick round robin.
 				 */
-				if (t->t_oncpu == cid)
-					kthread_release_cpu(t);
-				continue;
+				t->t_ticks = 0;
+				/* KLT: pass 0 to resume_user when staying in
+				 * the same address space (it then keeps CR3). */
+				pd_to_load = switch_pd_for(p);
+				hal_kernel_stack_set(t->t_stack_top);
+				sig_deliver(p, regs);
+				if (t->t_state == KT_RUN) {
+					/* Leaving kernel cooperation: the BKL
+					 * must not travel into user mode. */
+					if (kstack_overflowed(t))
+						printf("smp: STACK OVERFLOW tid %d cpu %d\n",
+						    t->t_tid, cid);
+					smp_bkl_drop();
+					sched_cpu[cid].sc_switches++;
+					idle_reported = 0;	/* dispatched */
+					/* S424: release mt on the next entry */
+					sched_cpu[cid].sc_prev = mt;
+					sched_cpu[cid].sc_parked = 0;
+					resume_user(pd_to_load, regs);
+				}
+				kthread_release_cpu(t);	/* sig_deliver killed it */
 			}
-			main_thread = (t->t_tid == p->uk_pid);
-			/* a whole-process block (single thread) stops the main TCB */
-			if (p->uk_state == P_BLOCKED && p->uk_p_nthreads <= 1) {
-				if (t->t_oncpu == cid)
-					kthread_release_cpu(t);
-				continue;
-			}
-			regs = main_thread ? &p->uk_regs : &t->t_regs;
-			cur = p;
-			cur_thread = t;
-			cpus[cid].ci_curthread = t;
-			/* KLT: pass 0 to resume_user when staying in the same
-			 * address space (it then keeps CR3); a nonzero pd both
-			 * updates cur_pd and is loaded by resume_user. */
-			pd_to_load = switch_pd_for(p);
-			hal_kernel_stack_set(t->t_stack_top);
-			sig_deliver(p, regs);
-			if (t->t_state == KT_RUN) {
-				/* Leaving kernel cooperation: the BKL must not
-				 * travel into user mode on this CPU. */
-				if (kstack_overflowed(t))
-					printf("smp: STACK OVERFLOW tid %d cpu %d\n",
-					    t->t_tid, cid);
-				smp_bkl_drop();
-				sched_cpu[cid].sc_switches++;
-				idle_reported = 0;	/* work was dispatched */
-				resume_user(pd_to_load, regs);
-			}
-			kthread_release_cpu(t);	/* sig_deliver killed it */
 		}
 		if (me != 0 && mt != 0 && mt->t_state == KT_RUN &&
-		    me->uk_state != P_ZOMBIE) {
+		    me->uk_state != P_ZOMBIE && me->uk_state != P_EXITING) {
 			cur = me;
 			cur_thread = mt;
 			cpus[cid].ci_curthread = mt;
@@ -3475,6 +3560,8 @@ proc_sched(void)
 			sig_deliver(me, &me->uk_regs);
 			smp_bkl_drop();
 			sched_cpu[cid].sc_switches++;
+			sched_cpu[cid].sc_prev = mt;	/* S424 */
+			sched_cpu[cid].sc_parked = 0;
 			resume_user(pd_to_load, &me->uk_regs);
 		}
 		/* nothing runnable: let deferred work drain, then halt */
@@ -3490,6 +3577,36 @@ proc_sched(void)
 		 * BSP 自己也可能又有活。hlt 前开中断，下一个 tick/IPI 会把它叫回来。
 		 */
 		if (smp_enabled) {
+			/*
+			 * S425: park on the kernel directory.  An idle CPU has
+			 * no user thread, and leaving a process PD in CR3 both
+			 * keeps that address space un-freeable (proc_exit()'s
+			 * quiesce waits for exactly this) and leaves its page
+			 * tables hot for nothing.  Everyone coming back through
+			 * switch_pd_for() compares against the live CR3, so the
+			 * reload happens automatically.
+			 */
+			if (hal_address_space_current() != (unsigned)IdlePTD) {
+				hal_address_space_activate((unsigned)IdlePTD);
+				cur_pd = (unsigned)IdlePTD;
+			}
+			/*
+			 * S424: mark the CPU as parked on the kernel directory.
+			 * proc_exit()'s address-space quiesce uses this: a
+			 * parked CPU has already loaded IdlePTD, so it is off
+			 * every user address space even though t_oncpu still
+			 * names it.
+			 *
+			 * Do NOT release the TCB ownership here.  The slot's
+			 * publication is keyed off t_oncpu (kthread_user_free
+			 * defers only while an owner exists), and this CPU is
+			 * still executing the idle loop on that very 16 KB
+			 * stack: publishing it would let another CPU's
+			 * kstack_alloc() bzero the stack underneath us, which
+			 * showed up as a garbage iret frame inside resume_user
+			 * (kernel TRAP 9, esp=0 ss=0, "system halted").
+			 */
+			sched_cpu[cid].sc_parked = 1;	/* S424 */
 			/*
 			 * S413: one summary per busy->idle transition so the
 			 * multi-core work is visible: the per-CPU switch
@@ -3725,6 +3842,21 @@ estcpu_decay_all(void)
 		if (p->uk_estcpu > ESTCPU_MAX)
 			p->uk_estcpu = ESTCPU_MAX;
 	}
+	/*
+	 * S424: the scheduling penalty is charged per thread now, so the
+	 * per-thread charge has to decay on the same schedule as the
+	 * process one - otherwise t_estcpu would only ever grow and every
+	 * long-lived thread would sink to the lowest priority.
+	 */
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used || t->t_estcpu <= 0)
+			continue;
+		t->t_estcpu = (t->t_estcpu * L2) / (L2 + 1);
+		if (t->t_estcpu > ESTCPU_MAX)
+			t->t_estcpu = ESTCPU_MAX;
+	}
 }
 
 /* EN: Is a TCB currently runnable (TCB state + whole-process block rule)? */
@@ -3737,7 +3869,7 @@ tcb_runnable(struct kthread *t)
 		return (0);
 	p = t->t_proc;
 	if (p->uk_state == P_FREE || p->uk_state == P_ZOMBIE ||
-	    p->uk_state == P_ALLOC)
+	    p->uk_state == P_ALLOC || p->uk_state == P_EXITING)
 		return (0);
 	if (p->uk_state == P_BLOCKED && p->uk_p_nthreads <= 1)
 		return (0);
@@ -3745,11 +3877,15 @@ tcb_runnable(struct kthread *t)
 }
 
 /*
- * EN: BSD-style interaction penalty from the owning process: a high estcpu
- * (CPU-bound) or a high p_nice (voluntary yield) lowers the thread's
- * effective priority; interactive (low estcpu) tasks stay high.  Lives in
- * the process layer because estcpu is on struct process; kthread.c calls it
- * through sched_interaction_penalty().
+ * EN: BSD-style interaction penalty: a high estcpu (CPU-bound) or a high
+ * p_nice (voluntary yield) lowers the thread's effective priority;
+ * interactive (low estcpu) tasks stay high.
+ *
+ * S424: the charge is per THREAD (t_estcpu).  It used to read uk_estcpu,
+ * which is charged once per tick to the whole process: an N-thread process
+ * therefore collected N times the charge of a single-threaded process at
+ * the same nice (getting N times the CPU share), while all its threads
+ * shared one penalty.  uk_estcpu is still maintained for /dev/ps.
  */
 int
 sched_interaction_penalty(struct kthread *t)
@@ -3761,7 +3897,7 @@ sched_interaction_penalty(struct kthread *t)
 		return (0);
 	/* 4.4BSD: usrpri = PUSER + estcpu/4 + 2*nice.  estcpu (0..255)
 	 * contributes 0..63; compress into a few priority levels here. */
-	penalty = (int)(p->uk_estcpu / 32);	/* estcpu/4 scaled to levels */
+	penalty = (int)(t->t_estcpu / 32);	/* estcpu/4 scaled to levels */
 	penalty += 2 * (int)(p->p_nice > 0 ? p->p_nice : 0) / 4; /* 2*nice */
 	if (penalty > 8)
 		penalty = 8;
@@ -3783,7 +3919,13 @@ sched_interaction_penalty(struct kthread *t)
 static int
 smt_affinity_score(struct kthread *t, int cid)
 {
-	int last = t->t_lastcpu;
+	/*
+	 * S424: t_want_cpu is where the thread last actually ran, i.e. where
+	 * its L1/L2 lines still are.  Ownership (t_oncpu) is a stack mutex
+	 * and is released as soon as the CPU switches away, so it can no
+	 * longer stand in for affinity - this is a pure placement hint.
+	 */
+	int last = (t->t_want_cpu >= 0) ? t->t_want_cpu : t->t_lastcpu;
 
 	if (last < 0 || last >= MAXCPU)
 		return (0);
@@ -3809,7 +3951,14 @@ fair_pick_next(struct kthread *me)
 	int best_prio = -1, best_aff = -1, i, start;
 	int cid = cpu_id();
 
-	start = (me != 0) ? (me - kthreads) : 0;
+	/*
+	 * S424: `me` may be a per-CPU idle carrier, which does not live in
+	 * the TCB pool - index arithmetic on it would produce a meaningless
+	 * rotation offset, so only use it when it really is a pooled TCB.
+	 */
+	start = 0;
+	if (me != 0 && me >= kthreads && me < kthreads + nkthread)
+		start = (int)(me - kthreads);
 	for (i = 0; i < nkthread; i++) {
 		struct kthread *t = &kthreads[(start + i + 1) % nkthread];
 		int prio, aff;
@@ -3857,6 +4006,8 @@ sched_tick(struct sysregs *r)
 
 	if (cur == 0 || me == 0 || r == 0)
 		return;
+	/* S424: the TCB this CPU left on an earlier tick may migrate now */
+	sched_release_prev();
 	/*
 	 * Preemption rule: user mode is always preemptable; kernel mode may
 	 * be inside a critical section (t_preempt_cnt > 0) or an opted-out
@@ -3888,14 +4039,37 @@ sched_tick(struct sysregs *r)
 		estcpu_decay_all();
 	}
 
-	/* anti-starvation: every waiting-but-runnable thread ages upward */
-	{
+	/*
+	 * Anti-starvation aging + sleep accounting.
+	 *
+	 * Every waiting-but-runnable thread ages upward (so a CPU-bound
+	 * thread cannot sit on the same low priority forever), and every
+	 * blocked thread accumulates sleep ticks - that is what makes
+	 * "slept long enough to be interactive" measurable; before this,
+	 * t_sleep_ticks only ever counted wakeups, not time.
+	 *
+	 * S424: it walks the whole TCB table and writes into live TCBs, so
+	 * it now runs on alternate ticks per CPU.  At 1024 slots x 16 CPUs x
+	 * 100 Hz the old version issued ~1.6 M written cache lines per
+	 * second at other CPUs' live threads - pure false sharing - and the
+	 * aging threshold is a wall-clock heuristic anyway.
+	 */
+	if ((++sched_cpu[cpu_id()].sc_tick & 1) == 0) {
 		int j;
-		for (j = 0; j < nkthread; j++)
-			if (kthreads[j].t_used && kthreads[j].t_state == KT_RUN &&
-			    &kthreads[j] != me &&
-			    kthreads[j].t_starve < STARVE_THRESHOLD * 2)
-				kthreads[j].t_starve++;
+
+		for (j = 0; j < nkthread; j++) {
+			struct kthread *o = &kthreads[j];
+
+			if (!o->t_used || o == me)
+				continue;
+			if (o->t_state == KT_RUN) {
+				if (o->t_starve < STARVE_THRESHOLD * 2)
+					o->t_starve++;
+			} else if (o->t_state == KT_BLOCK) {
+				if (o->t_sleep_ticks < 0x40000000)
+					o->t_sleep_ticks++;
+			}
+		}
 	}
 
 	/*
@@ -3944,6 +4118,8 @@ sched_tick(struct sysregs *r)
 	cur = p;
 	cur_thread = t;
 	cpus[cpu_id()].ci_curthread = t;
+	t->t_want_cpu = cpu_id();	/* S424: affinity hint */
+	t->t_ticks = 0;		/* S424: fresh quantum, see proc_sched() */
 	/* KLT: irq0's iret does not reload CR3, so switch it here —
 	 * but only when the selected thread is from another process.
 	 * Same-process thread switches keep the current page table. */
@@ -3957,6 +4133,9 @@ sched_tick(struct sysregs *r)
 		cur_pd = p->uk_pd;
 	hal_kernel_stack_set(t->t_stack_top);
 	*r = *regs;
+	/* S424: this CPU is about to leave me's stack - release it next entry */
+	sched_cpu[cpu_id()].sc_prev = me;
+	sched_cpu[cpu_id()].sc_parked = 0;
 	hal_intr_user_resume(r);
 	(void)atomic_add((volatile int *)&sched_switches, 1);
 	sched_cpu[cpu_id()].sc_switches++;
@@ -4068,6 +4247,89 @@ do_vfork(struct sysregs *r)
 	return (0);
 }
 
+#define	QUIESCE_TICKS	100	/* S425: max 1s wait for sibling CPUs */
+
+/*
+ * S425: make sure no CPU can still be running on this address space before
+ * the page directory is handed back to the allocator.
+ *
+ * S423 fixed the single-CPU half of this (the exiting thread switched to
+ * IdlePTD before publishing KT_ZOMBIE), but with threads the *siblings*
+ * matter too: they are running on other CPUs with this PD loaded.  Once
+ * free_address_space() returns the directory page to the pool, those CPUs
+ * fault while fetching the page-fault entry itself (_Xpage is only mapped
+ * through the PD) -> double -> triple fault.
+ *
+ * t_oncpu is exactly the "some CPU may still be on this TCB's stack" flag,
+ * and a CPU clears it only after switching off that stack (and therefore
+ * off this CR3), so waiting for it to reach -1 is the right barrier.
+ *
+ * Returns 1 when the address space is quiesced, 0 on timeout - the caller
+ * then leaks the directory instead of corrupting a live CPU.
+ */
+static int
+addrspace_quiesce(struct process *p)
+{
+	struct kthread *skip = cur_thread;
+	int i, cid = cpu_id(), busy;
+	unsigned deadline;
+
+	if (!smp_enabled)
+		return (1);
+	/*
+	 * This CPU is running on `skip`'s stack, so any other TCB it still
+	 * "owns" is by definition off-stack and can be dropped right now.
+	 */
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used || t->t_proc != p || t == skip)
+			continue;
+		if (t->t_oncpu == cid)
+			kthread_release_cpu(t);
+		else if (t->t_oncpu >= 0)
+			smp_resched_cpu(t->t_oncpu);
+	}
+	deadline = clock_get_ticks() + QUIESCE_TICKS;
+	for (;;) {
+		busy = -1;
+		for (i = 0; i < nkthread; i++) {
+			struct kthread *t = &kthreads[i];
+
+			if (!t->t_used || t->t_proc != p || t == skip)
+				continue;
+			if (t->t_oncpu >= 0) {
+				/*
+				 * S424: a CPU parked in the idle loop has
+				 * already switched CR3 to IdlePTD, so it is
+				 * off this address space even though it still
+				 * owns the TCB.
+				 */
+				if (sched_cpu[t->t_oncpu].sc_parked)
+					continue;
+				busy = i;
+				break;
+			}
+		}
+		if (busy < 0)
+			return (1);
+		if ((int)(clock_get_ticks() - deadline) >= 0) {
+			printf("smp: pid %d: address space busy (tid %d cpu %d),"
+			    " directory leaked\n", p->uk_pid,
+			    kthreads[busy].t_tid, kthreads[busy].t_oncpu);
+			return (0);
+		}
+		/*
+		 * A sibling may be spinning in smp_bkl_enter() with our CR3
+		 * loaded; it cannot make progress while we hold the BKL, so
+		 * let it through.  The process is P_EXITING, so nothing can
+		 * dispatch it or reap it while the lock is dropped.
+		 */
+		smp_bkl_drop();
+		smp_bkl_enter();
+	}
+}
+
 /* 中文：进程退出：唤醒 vfork/wait4 等待者并写状态，关闭所有 fd、释放线程与 mmap 及地址空间，置为僵尸或空闲 */
 /* EN: Process exit: wake vfork/wait4 waiters with status, close all fds, free thread/mmap/address space, then mark zombie or free */
 static void
@@ -4089,16 +4351,39 @@ proc_exit(int code)
 		if (p->uk_wait_pid != 0 && p->uk_wait_pid != cur->uk_pid)
 			continue;
 		if (p->uk_wait_status != 0 && user_ok(p->uk_wait_status, 4)) {
-			unsigned save = cur->uk_pd;
+			unsigned save = hal_address_space_current();
 
 			hal_address_space_activate(p->uk_pd);
 			*(int *)p->uk_wait_status = cur->uk_p_termsig ?
 			    (cur->uk_p_termsig & 0x7f) : ((code & 0xff) << 8);
 			hal_address_space_activate(save);
+			cur_pd = save;
 		}
 		p->uk_regs.eax = cur->uk_pid;
 		proc_wake(p);
 		reaped = 1;		/* the parent's wait4 gets the status */
+	}
+
+	/*
+	 * S425: retire every sibling thread first.  A CPU may only resume a
+	 * KT_RUN thread, so flipping them to KT_ZOMBIE is what stops new
+	 * dispatches while the address space is torn down underneath them.
+	 */
+	cur->uk_state = P_EXITING;
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used || t->t_proc != cur || t == cur_thread)
+			continue;
+		t->t_state = KT_ZOMBIE;
+	}
+	if (!addrspace_quiesce(cur)) {
+		/*
+		 * Degraded mode: a CPU is still on our CR3.  Keep the
+		 * directory alive (leak it) rather than hand a live CPU a
+		 * freed page table.
+		 */
+		cur->uk_pd_pinned = 1;
 	}
 
 	{
@@ -4110,11 +4395,6 @@ proc_exit(int code)
 	}
 	/* S300: close this process's IPC ports; wake waiters with EIO */
 	ipc_proc_exit((unsigned)cur->uk_pid);
-	/* release the process's main thread slot */
-	if (cur->uk_p_thread != 0) {
-		kthread_user_free(cur->uk_p_thread);
-		cur->uk_p_thread = 0;
-	}
 	/*
 	 * S17: release mmap bookkeeping first.  Shared page-cache pages must
 	 * be unmapped here so free_address_space() does not return them to the
@@ -4132,17 +4412,69 @@ proc_exit(int code)
 
 		/* CR3 wants the *physical* address (IdlePTD), not pm_pdir's VA */
 		hal_address_space_activate((unsigned)IdlePTD);
-		free_address_space(save);
+		cur_pd = (unsigned)IdlePTD;
+		if (!cur->uk_pd_pinned)
+			free_address_space(save);
 		cur->uk_pd = 0;
 	}
+	/*
+	 * S425: release every TCB of this process, not just the main one.
+	 * thread_exit_current() can reach here from any thread (the last one
+	 * to exit finishes the process), so the siblings - including the
+	 * early-exited main thread, which used to be left as a zombie no one
+	 * could ever reap - have to be freed here.  The current TCB goes
+	 * last: kthread_user_free() then takes the deferred path, so its
+	 * stack is only republished after this CPU has switched off it.
+	 */
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (t == cur_thread || !t->t_used || t->t_proc != cur)
+			continue;
+		kthread_user_free(t);
+	}
+	cur->uk_p_thread = 0;
+	if (cur_thread != 0)
+		kthread_user_free(cur_thread);
+	/*
+	 * S425: orphans.  Nothing reaps on behalf of a dead parent, so a
+	 * child whose parent disappears would keep pointing at a pid that no
+	 * longer waits for it: its own zombie would never be collected and
+	 * its children would be un-waitable forever (NPROC is 1024).  Adopt
+	 * live children to init and release the slots of children that are
+	 * already zombies - nobody is left to read their status.
+	 */
+	if (cur->uk_pid != 1) {
+		for (i = 0; i < NPROC; i++) {
+			struct process *c = &procs[i];
+
+			if (c == cur || c->uk_state == P_FREE ||
+			    c->uk_ppid != cur->uk_pid)
+				continue;
+			c->uk_ppid = 1;		/* adopted by init */
+			if (c->uk_state == P_ZOMBIE)
+				c->uk_state = P_FREE;	/* nobody to reap it */
+		}
+	}
 	cur->uk_exitcode = code;
-	cur->uk_state = reaped ? P_FREE : P_ZOMBIE;
 	if (cur->uk_ppid == 0) {
+		cur->uk_state = P_FREE;
 		printf("\n[user exit %d]\n", code);
 		mem_report();		/* the whole workload is gone: idle snapshot */
 		for (;;)
 			hal_cpu_halt();
 	}
+	/*
+	 * S425: if there is no parent left to wait for us, do not leave a
+	 * zombie behind - free the slot now.  `reaped` means a parent was
+	 * blocked in wait4() and already got the pid and status above.
+	 */
+	p = proc_find(cur->uk_ppid);
+	if (reaped || p == 0 || p->uk_state == P_FREE ||
+	    p->uk_state == P_EXITING)
+		cur->uk_state = P_FREE;
+	else
+		cur->uk_state = P_ZOMBIE;
 	proc_sched();
 }
 
@@ -4231,6 +4563,18 @@ sig_send(struct process *p, int sig)
 		return;
 	}
 	p->uk_p_sig |= SIG_TO_MASK(sig);
+	/*
+	 * S425: SIGKILL must also reach a stopped process - it never runs, so
+	 * it could never execute the default terminate action itself and sat
+	 * there forever holding its process slot.
+	 */
+	if (p->uk_state == P_STOPPED) {
+		if (sig == SIGKILL) {
+			p->uk_state = P_RUN;
+			p->uk_p_stopsig = 0;
+		}
+		return;
+	}
 	/* a blocked process gets EINTR and is made runnable again */
 	if (p->uk_state == P_BLOCKED) {
 		proc_wake(p);
@@ -4385,12 +4729,22 @@ sig_deliver(struct process *p, struct sysregs *r)
 		if (sig_default(sig) == 0)
 			continue;
 		/* terminate */
+		if (p != cur) {
+			/*
+			 * S425: unreachable today - both callers pass the
+			 * process they just loaded (proc_sched and the
+			 * syscall-exit path hand in `cur`).  The old code set
+			 * P_ZOMBIE here, which is a half exit: no fd close,
+			 * no IPC port release, no TCB teardown, no address
+			 * space free.  Route the signal back through the
+			 * normal pending path so the target exits through
+			 * proc_exit() on its own CPU instead.
+			 */
+			sig_send(p, sig);
+			return;
+		}
 		p->uk_p_termsig = sig;
-		if (p == cur)
-			proc_exit(sig);		/* never returns */
-		p->uk_exitcode = sig;
-		p->uk_state = P_ZOMBIE;
-		return;
+		proc_exit(sig);		/* never returns */
 	}
 }
 /* 中文：wait4 实现：回收指定（或任意）僵尸/停止子进程并写状态，无子进程返回 ECHILD，WNOHANG 立即返回，否则阻塞调度 */
@@ -4998,15 +5352,30 @@ thread_exit_current(int code)
 	int i;
 
 	if (t == 0 || t->t_tid == cur->uk_pid) {
-		if (cur->uk_p_nthreads <= 1) {
+		if (t == 0 || cur->uk_p_nthreads <= 1) {
 			proc_exit(code);
 			return;
 		}
-		/* main thread exits, other threads keep the process alive */
+		/*
+		 * S425: the main thread exits while its siblings are still
+		 * alive.  The old code set KT_ZOMBIE and then called
+		 * kthread_block_tcb(), whose multi-threaded branch rewrites
+		 * t_state to KT_BLOCK - so the TCB was neither a zombie nor
+		 * runnable, uk_p_nthreads was never decremented, and nothing
+		 * ever finished the process when the last sibling exited:
+		 * wait4() blocked forever and the address space leaked.
+		 * Retire the TCB properly and hand the "finish the process"
+		 * duty to the last thread to exit.
+		 */
+		cur->uk_exitcode = code;	/* the process status */
+		cur->uk_p_maingone = 1;
+		cur->uk_p_nthreads--;		/* S424: single owner */
 		t->t_exitcode = code;
+		hal_address_space_activate((unsigned)IdlePTD);
+		cur_pd = (unsigned)IdlePTD;
 		t->t_state = KT_ZOMBIE;
-		kthread_block_tcb(0);
-		proc_sched();
+		prio_restore(t);
+		proc_sched();			/* zombie: not resumable */
 		return;
 	}
 	/*
@@ -5026,7 +5395,18 @@ thread_exit_current(int code)
 	t->t_state = KT_ZOMBIE;
 	/* release inherited priority: the resource (this thread) is done */
 	prio_restore(t);
-	cur->uk_p_nthreads--;
+	cur->uk_p_nthreads--;		/* S424: single owner of this counter */
+	/*
+	 * S425: this was the last live thread of the process.  Somebody has
+	 * to run the process-level teardown now (nothing else will): the
+	 * main thread may have exited long ago (uk_p_maingone) and is only
+	 * waiting to be freed.  proc_exit() frees every remaining TCB,
+	 * including this one, and never returns.
+	 */
+	if (cur->uk_p_nthreads <= 0) {
+		proc_exit(cur->uk_p_maingone ? cur->uk_exitcode : code);
+		return;
+	}
 	for (i = 0; i < nkthread; i++) {
 		struct kthread *j = &kthreads[i];
 
@@ -5085,9 +5465,15 @@ thread_join(int tid, struct sysregs *r)
 		return (-ESRCH);
 	if (t->t_state == KT_ZOMBIE) {
 		code = t->t_exitcode;
+		/*
+		 * S424: uk_p_nthreads was already decremented when this TCB
+		 * became a zombie (thread_exit_current), and kthread_user_free()
+		 * no longer touches it.  The extra decrement that used to live
+		 * here made a joined thread cost 2-3 counts, so a process with
+		 * live runnable siblings could look single-threaded and have
+		 * them frozen by a blocking sibling.
+		 */
 		kthread_user_free(t);
-		if (cur->uk_p_nthreads > 1)
-			cur->uk_p_nthreads--;
 		return (code);
 	}
 	jt = cur_thread;

@@ -140,6 +140,9 @@ $stb = Join-Path $ws "out\userland\schedtest.elf"
 if (Test-Path $stb) { Copy-Item $stb "$isodir\bin\SCHEDTEST.ELF" -Force }
 $ptb = Join-Path $ws "out\userland\pthread.elf"
 if (Test-Path $ptb) { Copy-Item $ptb "$isodir\bin\PTHREAD.ELF" -Force }
+# S425: main-thread-exits-first regression
+$pmb = Join-Path $ws "out\userland\pthmain.elf"
+if (Test-Path $pmb) { Copy-Item $pmb "$isodir\bin\PTHMAIN.ELF" -Force }
 $atb = Join-Path $ws "out\userland\aiotest.elf"
 if (Test-Path $atb) { Copy-Item $atb "$isodir\bin\AIOTEST.ELF" -Force }
 $urb = Join-Path $ws "out\userland\uring.elf"

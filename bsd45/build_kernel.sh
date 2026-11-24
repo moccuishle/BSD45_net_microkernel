@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# build_kernel.sh - cross-build the 4.5BSD-Lite2 i386 kernel as ELF32.
+# build_kernel.sh - build the 4.5BSD-Lite2 i386 kernel as ELF32.
+#
+#	bash build_kernel.sh                 # full build
+#	bash build_kernel.sh --no-link       # objects only
+#	bash build_kernel.sh --only usermode.o
+#
+# Environment (the PowerShell switches, as variables):
+#   ARCH=i386  KERNEL_UNICODE=1  KERNEL_DEFINE=A,B  BSD45_TOOLCHAIN=native|mingw
+#
+# Mirrors build_kernel.ps1.  On the mingw path the image is linked as a PE at
+# KERNBASE and rewritten with objcopy; on the native path gcc emits ELF32 and
+# boot/i386/kernel.ld places it at the same addresses.  Either way stage2 finds
+# the same PT_LOAD segments.
 set -uo pipefail
 ws="$(cd "$(dirname "$0")" && pwd)"
 . "$ws/tools-find.sh"
@@ -10,10 +22,18 @@ bld="$ws/build"
 obj="$bld/obj"
 inc="$bld/inc"
 gen="$bld/gen"
-mkdir -p "$bld" "$obj" "$gen" "$inc/sys" "$inc/vm" "$inc/machine" "$inc/i386" "$inc/lib"
+mkdir -p "$bld" "$obj" "$gen" "$inc/sys" "$inc/vm" "$inc/machine" "$inc/i386" "$inc/lib" "$inc/libkern"
+toolchain_banner
 
-require_tools gcc ld objcopy objdump
-gccinc="$(find_gcc_include)"
+no_link=0
+only=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--no-link|-n) no_link=1; shift ;;
+		--only|-o)    only="${2:-}"; shift 2 ;;
+		*) echo "usage: $0 [--no-link] [--only obj.o]" >&2; exit 2 ;;
+	esac
+done
 
 step() { echo "== $1"; }
 fail=0
@@ -24,14 +44,13 @@ cp -f "$src/include/sys/"*.h      "$inc/sys/"      2>/dev/null
 cp -f "$src/vm/"*.h               "$inc/vm/"       2>/dev/null
 cp -f "$src/include/machine/"*.h  "$inc/machine/"  2>/dev/null
 cp -f "$src/include/machine/"*.h  "$inc/i386/"     2>/dev/null
-cp -f "$src/lib/libkern.h"    "$inc/lib/libkern.h" 2>/dev/null
-# 4.5BSD's <sys/systm.h> still includes <libkern/libkern.h>; build_kernel.ps1
-# keeps a copy at that old path, so do the same here.
-mkdir -p "$inc/libkern"
-cp -f "$src/lib/libkern.h"    "$inc/libkern/libkern.h" 2>/dev/null
+cp -f "$src/lib/libkern.h"        "$inc/lib/libkern.h" 2>/dev/null
+# 4.5BSD's <sys/systm.h> still includes <libkern/libkern.h>; keep a copy at
+# that old path, exactly like build_kernel.ps1.
+cp -f "$src/lib/libkern.h"        "$inc/libkern/libkern.h" 2>/dev/null
 
 if ! grep -q 'typedef int register_t;' "$inc/machine/types.h" 2>/dev/null; then
-    printf '\ntypedef int register_t;\ntypedef unsigned int u_register_t;\n' >> "$inc/machine/types.h"
+	printf '\ntypedef int register_t;\ntypedef unsigned int u_register_t;\n' >> "$inc/machine/types.h"
 fi
 
 cat > "$inc/string.h" <<'EOF'
@@ -78,11 +97,16 @@ printf '#define NWD 0\n'  > "$gen/wd.h"
 printf '#define NFD 0\n'  > "$gen/fd.h"
 
 # ---------------------------------------------------------------- assym.s
+# genassym must see the *target* i386 layout, so it is compiled with the target
+# compiler at -m32, but it runs on the host: with the mingw toolchain on
+# Windows that is a 32-bit PE, with native gcc it is a 32-bit ELF.
 step "genassym"
-gcc -m32 -O1 -std=gnu89 -fno-strict-aliasing -mno-ms-bitfields \
-    -I "$inc" -DKERNEL -o "$bld/genassym" "$src/arch/i386/i386/genassym.c" || {
-    echo "genassym build failed" >&2; exit 1; }
-"$bld/genassym" > "$bld/assym.s" || { echo "genassym run failed" >&2; exit 1; }
+"$HOSTCC" -m32 -O1 -std=gnu89 -fno-strict-aliasing -mno-ms-bitfields \
+	-I "$inc" -DKERNEL -o "$bld/genassym$HOSTEXE" "$src/arch/i386/i386/genassym.c" || {
+	echo "genassym build failed" >&2; exit 1; }
+"$bld/genassym$HOSTEXE" > "$bld/assym.s" || { echo "genassym run failed" >&2; exit 1; }
+if [ ! -s "$bld/assym.s" ]; then echo "genassym produced no output" >&2; exit 1; fi
+echo "  assym.s: $(stat -c%s "$bld/assym.s" 2>/dev/null || wc -c < "$bld/assym.s") bytes"
 
 cat > "$bld/vector.s" <<'EOF'
 /*
@@ -92,162 +116,247 @@ cat > "$bld/vector.s" <<'EOF'
  */
 EOF
 
-# ---------------------------------------------------------------- embed.c
-# Mirror of build_kernel.ps1: embed the hello/init ELF images AND the two
-# on-disk boot stages (stage1_hdd MBR + stage2) so the in-guest `install`
-# command can write them to the ATA disk.  Built with the Linux elf_i386
-# toolchain (no i386pe / -fleading-underscore here).
-step "embedding userland + boot stages"
-
-append_bytes() {   # append_bytes <cname> <file>
-    local cname="$1" p="$2"
-    echo "const unsigned char ${cname}[] = {"
-    if [ -f "$p" ]; then
-        od -An -v -tx1 "$p" | awk '{ for (i=1;i<=NF;i++) printf "0x%s,", $i; printf "\n" }'
-        echo "};"
-        echo "const unsigned int ${cname}_len = $(stat -c%s "$p" 2>/dev/null || wc -c < "$p");"
-    else
-        echo "};"
-        echo "const unsigned int ${cname}_len = 0;"
-    fi
-}
-
+# ---------------------------------------------------------------- blobs
+# The two on-disk boot stages and the AP trampoline are linked at fixed
+# addresses and embedded as flat byte arrays: `install` writes stage1_hdd and
+# stage2 to the ATA disk, and smp.c copies ap_tramp_bin below 1 MB for the APs.
+# All three are position-dependent, so -Ttext + objcopy -O binary.
+step "boot stages + AP trampoline"
 build_raw_stage() {   # build_raw_stage <src> <text> <name> <entry>
-    local src="$1" text="$2" name="$3" entry="$4"
-    local o="$bld/$name.embed.o" e="$bld/$name.embed.elf" raw="$bld/$name.embed.bin"
-    gcc -m32 -c -x assembler-with-cpp -o "$o" "$src" || return 1
-    ld -m elf_i386 -Ttext "$text" -e "$entry" -o "$e" "$o" || return 1
-    objcopy -O binary --only-section=.text "$e" "$raw" || return 1
-    echo "$raw"
+	local s="$1" text="$2" name="$3" entry="$4"
+	local o="$bld/$name.embed.o" img="$bld/$name.embed.img" raw="$bld/$name.embed.bin"
+
+	"$CC" "${CROSSBIN[@]}" "${TARGET32[@]}" -c -x assembler-with-cpp -o "$o" "$s" || return 1
+	if [ "$TOOLCHAIN" = mingw ]; then
+		"$LD" -m i386pe -Ttext "$text" -e "$entry" --subsystem console \
+			--disable-reloc-section -o "$img" "$o" 2>/dev/null || return 1
+	else
+		"$LD" -m elf_i386 -Ttext "$text" -e "$entry" -o "$img" "$o" 2>/dev/null || return 1
+	fi
+	"$OBJCOPY" -O binary --only-section=.text "$img" "$raw" || return 1
+	echo "$raw"
 }
 
 s1h="$(build_raw_stage "$ws/boot/i386/stage1_hdd.s" 0x7C00 stage1_hdd _start)" || {
-    echo "stage1_hdd build failed" >&2; exit 1; }
+	echo "stage1_hdd build failed" >&2; exit 1; }
 s2e="$(build_raw_stage "$ws/boot/i386/stage2.s" 0x90000 stage2 _start32)" || {
-    echo "stage2 (embed) build failed" >&2; exit 1; }
-n1h=$(stat -c%s "$s1h" 2>/dev/null || wc -c < "$s1h")
+	echo "stage2 (embed) build failed" >&2; exit 1; }
+apt="$(build_raw_stage "$src/arch/$ARCH/ap_tramp.s" 0x7000 ap_tramp _ap_tramp_start)" || {
+	echo "ap_tramp build failed" >&2; exit 1; }
+fsize() { stat -c%s "$1" 2>/dev/null || wc -c < "$1"; }
+n1h=$(fsize "$s1h")
 if [ "$n1h" -ne 512 ]; then
-    echo "stage1_hdd must be 512 bytes, got $n1h" >&2; exit 1
+	echo "stage1_hdd must be 512 bytes, got $n1h" >&2; exit 1
 fi
-echo "  embedded boot stages: stage1_hdd $n1h bytes, stage2 $(stat -c%s "$s2e" 2>/dev/null || wc -c < "$s2e") bytes"
+# S412: smp.c patches the data block at offset 0x300 and the entry pointer at
+# 0x312, so the blob must reach 0x316.  (The PE link pads .text a little
+# further; the ELF link stops exactly at _ap_tramp_end, which is 0x316.)
+if [ "$(fsize "$apt")" -lt $((0x316)) ]; then
+	echo "ap_tramp too small: $(fsize "$apt") bytes" >&2; exit 1
+fi
+echo "  embedded: stage1_hdd $n1h, stage2 $(fsize "$s2e"), ap_tramp $(fsize "$apt") bytes"
+
+append_bytes() {   # append_bytes <cname> <file>
+	local cname="$1" p="$2" n=0
+	echo "const unsigned char ${cname}[] = {"
+	if [ -f "$p" ]; then
+		od -An -v -tx1 "$p" | awk '{ for (i=1;i<=NF;i++) printf "0x%s,", $i; printf "\n" }'
+		n=$(fsize "$p")
+	fi
+	echo "};"
+	echo "const unsigned int ${cname}_len = $n;"
+}
 
 {
-    echo "/* generated by build_kernel.sh */"
-    for name in hello init; do
-        append_bytes "${name}_elf" "$ws/out/userland/$name.elf"
-    done
-    append_bytes "stage1_hdd_bin" "$s1h"
-    append_bytes "stage2_bin" "$s2e"
+	echo "/* generated by build_kernel.sh */"
+	for name in hello init; do
+		append_bytes "${name}_elf" "$ws/out/userland/$name.elf"
+	done
+	append_bytes "stage1_hdd_bin" "$s1h"
+	append_bytes "stage2_bin" "$s2e"
+	append_bytes "ap_tramp_bin" "$apt"
 } > "$bld/embed.c"
 
-# ---------------------------------------------------------------- compile
-step "compiling"
-cflags=(-m32 -std=gnu89 -O2 -ffreestanding -fleading-underscore
-    -fno-pie -fno-pic -fcommon -fno-builtin
-    -fno-stack-protector -fno-asynchronous-unwind-tables
-    -fno-unwind-tables -fno-tree-loop-distribute-patterns
-    -march=i386 -mno-sse -mno-sse2 -mno-mmx -mno-avx
-    -mno-ms-bitfields -mpreferred-stack-boundary=2
-    -ffunction-sections -fdata-sections
-    -nostdinc -I "$inc" -I "$gen" -I "$src"
-    -I "$src/arch" -I "$src/fs" -I "$src/driver" -I "$src/net"
-    -isystem "$gccinc" -DKERNEL -DARCH_$ARCH)
+# ---------------------------------------------------------------- flags
+cflags=("${TARGET32[@]}" "${CROSSBIN[@]}" "${LEADUS[@]}"
+	-std=gnu89 -O2 -ffreestanding
+	-fno-pie -fno-pic -fcommon -fno-builtin
+	-fno-stack-protector -fno-asynchronous-unwind-tables
+	-fno-unwind-tables -fno-tree-loop-distribute-patterns
+	-march=i386 -mno-sse -mno-sse2 -mno-mmx -mno-avx
+	-mno-ms-bitfields -mpreferred-stack-boundary=2
+	-ffunction-sections -fdata-sections
+	-nostdinc -I "$inc" -I "$gen" -I "$src"
+	-I "$src/arch" -I "$src/fs" -I "$src/driver" -I "$src/net"
+	-isystem "$(find_gcc_include)" -DKERNEL "-DARCH_$ARCH")
 if [ "${KERNEL_UNICODE:-0}" = "1" ]; then
-    cflags+=(-DKERNEL_UNICODE=1)
+	cflags+=(-DKERNEL_UNICODE=1)
 fi
-# Equivalent of build_kernel.ps1 -Define: comma-separated compile-time macros.
+# Equivalent of build_kernel.ps1 -Define: comma-separated compile-time macros,
 # e.g. KERNEL_DEFINE=S10_AUTOTEST or KERNEL_DEFINE=S10_AUTOTEST,VM_INSTALL_AUTOTEST
 if [ -n "${KERNEL_DEFINE:-}" ]; then
-    IFS=',' read -ra _defs <<< "$KERNEL_DEFINE"
-    for d in "${_defs[@]}"; do
-        [ -n "$d" ] && cflags+=("-D$d")
-    done
+	IFS=',' read -ra _defs <<< "$KERNEL_DEFINE"
+	for d in "${_defs[@]}"; do
+		[ -n "$d" ] && cflags+=("-D$d")
+	done
 fi
 
 compile_c() {
-    local file="$1" out="$2" log
-    log="$(gcc "${cflags[@]}" -c -o "$out" "$file" 2>&1)"
-    if [ $? -ne 0 ]; then
-        echo "FAIL $file"; echo "$log" | head -40 | sed 's/^/   /'; fail=$((fail+1)); return 1
-    fi
-    return 0
-}
-assemble() {
-    local file="$1" out="$2" log
-    log="$(gcc -m32 -c -x assembler-with-cpp -nostdinc -I "$bld" -I "$inc" -I "$gen" \
-        -I "$src" -I "$src/arch" -I "$src/fs" -I "$src/driver" -I "$src/net" \
-        -I "$inc/sys" -DKERNEL -DLOCORE -o "$out" "$file" 2>&1)"
-    if [ $? -ne 0 ]; then
-        echo "FAIL $file"; echo "$log" | head -40 | sed 's/^/   /'; fail=$((fail+1)); return 1
-    fi
-    return 0
+	local file="$1" out="$2" log
+	if [ ! -f "$file" ]; then echo "FAIL $file (missing)"; fail=$((fail+1)); return 1; fi
+	log="$("$CC" "${cflags[@]}" -c -o "$out" "$file" 2>&1)"
+	if [ $? -ne 0 ]; then
+		echo "FAIL $file"; echo "$log" | head -40 | sed 's/^/   /'; fail=$((fail+1)); return 1
+	fi
+	return 0
 }
 
+assemble() {
+	local file="$1" out="$2" log
+	if [ ! -f "$file" ]; then echo "FAIL $file (missing)"; fail=$((fail+1)); return 1; fi
+	log="$("$CC" "${TARGET32[@]}" "${CROSSBIN[@]}" -c -x assembler-with-cpp -nostdinc \
+		-I "$bld" -I "$inc" -I "$gen" -I "$src" -I "$src/arch" -I "$src/fs" \
+		-I "$src/driver" -I "$src/net" -I "$inc/sys" -DKERNEL -DLOCORE \
+		-o "$out" "$file" 2>&1)"
+	if [ $? -ne 0 ]; then
+		echo "FAIL $file"; echo "$log" | head -40 | sed 's/^/   /'; fail=$((fail+1)); return 1
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- compile
+step "compiling"
 objects=()
+# kind:path - the same set build_kernel.ps1 compiles, in the same order.
+# ap_tramp.s is NOT in this list: it is a raw blob linked at 0x7000 and
+# embedded through embed.c above (S412).
 sources=(
-    "asm:$src/arch/i386/isa/locore.s"
-    "c:$src/arch/i386/isa/pmap.c"
-    "c:$src/arch/i386/isa/machdep.c"
-    "c:$src/arch/i386/i386/cons.c"
-    "c:$src/lib/bcmp.c"
-    "c:$src/lib/strcmp.c"
-    "c:$src/lib/strlen.c"
-    "c:$src/lib/strings.c"
-    "c:$src/sys/usermode.c"
-    "asm:$src/arch/$ARCH/usermode_asm.s"
-    "c:$bld/embed.c"
-    "c:$src/driver/pccon.c"
-    "c:$src/sys/stubs.c"
-    "c:$src/sys/glue.c"
-    "c:$src/sys/mon.c"
-    "c:$src/driver/atapi.c"
-    "c:$src/driver/ata.c"
-    "c:$src/fs/isofs.c"
-    "c:$src/fs/ffs/ffs.c"
-    "c:$src/fs/jlfs/jlfs.c"
-    "c:$src/fs/ffs/install.c"
-    "c:$src/fs/tmpfs.c"
-    "c:$src/lib/kstr.c"
-    # subsys/ personality layer removed: syscalls dispatch straight to
-    # bsd45_syscall(); struct sysregs now lives in include/sys/platform.h
-    "c:$src/thread/kthread.c"
-    "c:$src/thread/sync.c"
-    "c:$src/thread/kipc.c"
-    "c:$src/thread/softirq.c"
-    "asm:$src/arch/$ARCH/kswitch.s"
-    "asm:$src/arch/$ARCH/x86.asm"
-    "asm:$src/arch/$ARCH/smp_ipi.s"
-    "asm:$src/arch/$ARCH/ap_tramp.s"
-    # kernel/hal removed: context + timer folded into arch/i386, no IPL layer
-    "c:$src/arch/$ARCH/smp.c"
-    "c:$src/arch/$ARCH/atomic.c"
-    "c:$src/arch/$ARCH/ctx.c"
-    "c:$src/arch/$ARCH/timer.c"
-    "c:$src/vm/zcomp.c"
-    "c:$src/vm/mem_plan.c"
-    "c:$src/fs/aio.c"
-    "c:$src/fs/vfs_bio.c"
-    "c:$src/fs/vfs_cache.c"
-    "c:$src/vm/pagecache.c"
-    "c:$src/fs/vfs.c"
+	"asm:$src/arch/i386/isa/locore.s"
+	"c:$src/arch/i386/isa/pmap.c"
+	"c:$src/arch/i386/isa/machdep.c"
+	"c:$src/arch/i386/i386/cons.c"
+	"c:$src/lib/bcmp.c"
+	"c:$src/lib/strcmp.c"
+	"c:$src/lib/strlen.c"
+	"c:$src/lib/strings.c"
+	"c:$src/sys/usermode.c"
+	"asm:$src/arch/$ARCH/usermode_asm.s"
+	"c:$bld/embed.c"
+	"c:$src/driver/pccon.c"
+	"c:$src/sys/stubs.c"
+	"c:$src/sys/glue.c"
+	"c:$src/sys/mon.c"
+	"c:$src/driver/atapi.c"
+	"c:$src/driver/ata.c"
+	"c:$src/fs/isofs.c"
+	"c:$src/fs/ffs/ffs.c"
+	"c:$src/fs/jlfs/jlfs.c"
+	"c:$src/fs/ffs/install.c"
+	"c:$src/fs/tmpfs.c"
+	"c:$src/lib/kstr.c"
+	# subsys/ personality layer removed: syscalls dispatch straight to
+	# bsd45_syscall(); struct sysregs now lives in include/sys/platform.h
+	"c:$src/thread/kthread.c"
+	"c:$src/thread/sync.c"
+	"c:$src/thread/kipc.c"
+	"c:$src/thread/softirq.c"
+	"asm:$src/arch/$ARCH/kswitch.s"
+	"asm:$src/arch/$ARCH/x86.asm"
+	"asm:$src/arch/$ARCH/smp_ipi.s"
+	# kernel/hal removed: context + timer folded into arch/i386, no IPL layer
+	"c:$src/arch/$ARCH/smp.c"
+	"c:$src/arch/$ARCH/atomic.c"
+	"c:$src/arch/$ARCH/ctx.c"
+	"c:$src/arch/$ARCH/timer.c"
+	"c:$src/vm/zcomp.c"
+	"c:$src/vm/mem_plan.c"
+	"c:$src/fs/aio.c"
+	"c:$src/fs/vfs_bio.c"
+	"c:$src/fs/vfs_cache.c"
+	"c:$src/vm/pagecache.c"
+	"c:$src/fs/vfs.c"
 )
 for spec in "${sources[@]}"; do
-    kind="${spec%%:*}"; file="${spec#*:}"
-    base="$(basename "${file%.*}").o"
-    out="$obj/$base"
-    if [ "$kind" = "asm" ]; then assemble "$file" "$out"; else compile_c "$file" "$out"; fi
-    [ $? -eq 0 ] && objects+=("$out")
+	kind="${spec%%:*}"; file="${spec#*:}"
+	out="$obj/$(basename "${file%.*}").o"
+	if [ -n "$only" ]; then
+		[ "$(basename "$out")" = "$only" ] || { [ -f "$out" ] && objects+=("$out"); continue; }
+	fi
+	if [ "$kind" = "asm" ]; then
+		assemble "$file" "$out" && objects+=("$out")
+	else
+		compile_c "$file" "$out" && objects+=("$out")
+	fi
 done
 
-[ "$fail" -ne 0 ] && { echo "$fail file(s) failed" >&2; exit 1; }
+if [ "$fail" -ne 0 ]; then echo "$fail file(s) failed" >&2; exit 1; fi
+if [ "$no_link" -ne 0 ]; then echo "objects built"; exit 0; fi
 
 # ---------------------------------------------------------------- link
 step "linking"
-ld -m elf_i386 -T "$ws/boot/i386/kernel.ld" -e start --gc-sections \
-    -o "$bld/bsd45.elf" "${objects[@]}" "$(gcc -m32 -print-libgcc-file-name)" || {
-    echo "link failed" >&2; exit 1; }
+if [ "$TOOLCHAIN" = mingw ]; then
+	# PE/COFF target: every *static* zero-initialised array lands in .data$*
+	# with its bytes, so `static char heap[256KB]` really costs 256 KB in the
+	# image (a Linux ELF toolchain puts the same object in .bss).  Rewriting
+	# those sections as .bss is a pure representation change and is what keeps
+	# the staged file inside the 576 KB below 0x90000.
+	fixer="$ws/tools/pe_bss_fix.py"
+	if py="$(find_python)" && [ -f "$fixer" ]; then
+		"$py" "$fixer" --recurse "$obj" || { echo "pe_bss_fix.py failed" >&2; exit 1; }
+	else
+		echo "warning: no working python3 - zero-initialised static arrays stay in .data" >&2
+		echo "         the kernel image will be ~450 KB larger than it should be" >&2
+	fi
 
-cp -f "$bld/bsd45.elf" "$ws/out/BSD45.ELF"
-echo "built $bld/bsd45.elf"
-objdump -h "$bld/bsd45.elf" | head -12
+	ldflags=(-m i386pe --image-base 0xFE000000 -Ttext 0xFE101000
+		--subsystem console -e start --gc-sections
+		# the kernel is loaded at a fixed address by stage2, and binutils
+		# >= 2.4x refuses a base-reloc table for images with 8-bit fixups
+		--disable-reloc-section
+		--file-alignment 0x1000 --section-alignment 0x1000)
 
+	# pass 1: discover the section layout with a harmless _end
+	"$LD" "${ldflags[@]}" --defsym _end=0xFE180000 --defsym _edata=0xFE140000 \
+		--defsym _etext=0xFE140000 -o "$bld/kernel.pe" "${objects[@]}" 2>&1 |
+		head -40
+	[ -f "$bld/kernel.pe" ] || { echo "link pass1 failed" >&2; exit 1; }
+
+	max_end=0; text_end=0; data_end=0
+	while read -r _idx name size vma _rest; do
+		case "$name" in .*) ;; *) continue ;; esac
+		[ ${#size} -eq 8 ] && [ ${#vma} -eq 8 ] || continue
+		sz=$((16#$size)); va=$((16#$vma))
+		case "$name" in .text) text_end=$((va + sz)) ;; esac
+		case "$name" in .bss)  data_end=$va ;; esac
+		case "$name" in .reloc) continue ;; esac
+		[ $((va + sz)) -gt "$max_end" ] && max_end=$((va + sz))
+	done < <("$OBJDUMP" -h "$bld/kernel.pe")
+
+	end_addr=$(( ((max_end + 0xFFF) / 0x1000) * 0x1000 ))
+	[ "$text_end" -eq 0 ] && text_end=0xFE101000
+	[ "$data_end" -eq 0 ] && data_end=$max_end
+	printf 'sections end %x, _end %x, _edata %x, _etext %x\n' \
+		"$max_end" "$end_addr" "$data_end" "$text_end"
+
+	"$LD" "${ldflags[@]}" \
+		"--defsym=_end=0x$(printf %x "$end_addr")" \
+		"--defsym=_edata=0x$(printf %x "$data_end")" \
+		"--defsym=_etext=0x$(printf %x "$text_end")" \
+		-o "$bld/kernel.pe" "${objects[@]}" 2>&1 | head -40
+	[ -f "$bld/kernel.pe" ] || { echo "link pass2 failed" >&2; exit 1; }
+
+	"$OBJCOPY" -O elf32-i386 -R .idata -R .reloc "$bld/kernel.pe" "$bld/bsd45.elf" ||
+		{ echo "objcopy failed" >&2; exit 1; }
+else
+	# Native: gcc already emitted ELF32, so the script does the layout that
+	# kernel.ld describes and ld resolves _etext/_edata/_end there.
+	"$LD" -m elf_i386 -T "$ws/boot/i386/kernel.ld" -e start --gc-sections \
+		-o "$bld/bsd45.elf" "${objects[@]}" \
+		"$("$CC" "${TARGET32[@]}" -print-libgcc-file-name)" ||
+		{ echo "link failed" >&2; exit 1; }
+fi
+
+mkdir -p "$ws/out"
+cp -f "$bld/bsd45.elf" "$ws/out/BSD45.ELF" 2>/dev/null
+echo "built $bld/bsd45.elf ($(fsize "$bld/bsd45.elf") bytes)"
+"$OBJDUMP" -h "$bld/bsd45.elf" | head -12

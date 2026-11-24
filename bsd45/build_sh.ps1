@@ -242,17 +242,40 @@ if ($Target -eq "sh") {
     if (!(Test-Path "$gen\nodes.c")) { Write-Host "mknodes failed" -ForegroundColor Red; $fail++ }
     if (!(Test-Path "$gen\syntax.c")) { Write-Host "mksyntax failed" -ForegroundColor Red; $fail++ }
 
-    Write-Step "bison/flex"
+    Write-Step "yacc/lex"
     Push-Location $gen
-    # 4.5BSD's arith.y marks every action with "= {" (a local yacc dialect);
-    # plain bison wants "{".  Old yacc also let yyerror() use yyerrok/yyclearin,
-    # which bison scopes to yyparse, so drop those two statements.
-    (Get-Content arith.y) -replace '= \{', '{' |
-        Where-Object { $_ -notmatch '^\s*(yyerrok|yyclearin);' } |
-        Set-Content arith_sane.y -Encoding ASCII
-    & $bash -c "bison -y -d arith_sane.y" 2>&1 | Select-Object -First 8
-    if (Test-Path y.tab.c) { Copy-Item y.tab.c arith.c -Force }
-    & $bash -c "flex -o arith_lex.c arith_lex.l" 2>&1 | Select-Object -First 8
+    # S426: prefer the 4.4BSD-Lite2 tools (byacc + contrib flex 2.5.2) that
+    # tools/build_bsdtools.ps1 produces in tools\hostbin.  byacc consumes
+    # 4.5BSD's arith.y as written:
+    #   - "= {" is byacc's action-sharing notation; bison only understands
+    #     "{", which is why the fallback below has to rewrite the grammar;
+    #   - yyerrok/yyclearin are plain global macros in byacc, while bison
+    #     scopes them to yyparse, so the fallback has to drop those lines.
+    # Using the period-correct tools therefore removes two edits from the
+    # shell sources.
+    $byacc  = Join-Path $ws "tools\hostbin\yacc.exe"
+    $bdflex = Join-Path $ws "tools\hostbin\flex.exe"
+    $gened  = $false
+    Remove-Item y.tab.c, y.tab.h, arith.c, arith_lex.c -ErrorAction SilentlyContinue
+    if ((Test-Path $byacc) -and (Test-Path $bdflex)) {
+        & $byacc -d arith.y 2>&1 | Select-Object -First 8
+        if (Test-Path y.tab.c) { Copy-Item y.tab.c arith.c -Force }
+        # flex 2.5.2 only accepts the output name attached to -o.
+        & $bdflex -oarith_lex.c arith_lex.l 2>&1 | Select-Object -First 8
+        if ((Test-Path arith.c) -and (Test-Path arith_lex.c)) { $gened = $true }
+    }
+    if (-not $gened) {
+        Write-Host "  BSD yacc/flex missing - falling back to bison/flex" -ForegroundColor Yellow
+        # 4.5BSD's arith.y marks every action with "= {" (a local yacc dialect);
+        # plain bison wants "{".  Old yacc also let yyerror() use yyerrok/yyclearin,
+        # which bison scopes to yyparse, so drop those two statements.
+        (Get-Content arith.y) -replace '= \{', '{' |
+            Where-Object { $_ -notmatch '^\s*(yyerrok|yyclearin);' } |
+            Set-Content arith_sane.y -Encoding ASCII
+        & $bash -c "bison -y -d arith_sane.y" 2>&1 | Select-Object -First 8
+        if (Test-Path y.tab.c) { Copy-Item y.tab.c arith.c -Force }
+        & $bash -c "flex -o arith_lex.c arith_lex.l" 2>&1 | Select-Object -First 8
+    }
     Pop-Location
 
     Write-Step "compiling sh"

@@ -77,6 +77,8 @@ extern int	nkthread;	/* runtime TCB slots, set by mem_plan_init() */
 
 /* dynamic priority tuning */
 #define	PRI_BOOST_IO	6	/* boost on wake from sleep/I/O */
+#define	PRI_BOOST_TICKS	3	/* S424: how long that boost lasts (ticks) */
+#define	ESTCPU_MAX_T	255	/* S424: per-thread CPU charge ceiling */
 #define	PRI_BOOST_STARVE	8	/* max anti-starvation boost */
 #define	STARVE_THRESHOLD	40	/* ticks before anti-starvation kicks in */
 #define	CPU_BOUND_THRESHOLD	3	/* consecutive CPU quanta => CPU-bound */
@@ -121,7 +123,25 @@ struct kthread {
 	int		t_sleep_ticks;	/* ticks slept: I/O-bound detector */
 	int		t_starve;	/* ticks waiting: anti-starvation boost */
 	int		t_cpu_burst;	/* consecutive CPU ticks: CPU-bound detector */
+	/* S424: remaining ticks of the "woken from a real sleep, treat as
+	 * interactive" boost.  The old test was t_sleep_ticks > 0, but that
+	 * counter is never cleared, so every thread that had ever blocked
+	 * kept the boost forever and it stopped discriminating anything.
+	 * This one decays per tick so the boost only covers the wakeup. */
+	int		t_ioboost;
+	/* S424: per-thread CPU charge for the BSD interaction penalty.
+	 * uk_estcpu is per process, so with it alone an 8-thread process
+	 * collected 8x the charge of a single-threaded one and every thread
+	 * shared the same penalty; charging the TCB makes the scheduler's
+	 * unit (a thread) match its accounting unit.  uk_estcpu keeps being
+	 * maintained for /dev/ps compatibility. */
+	int		t_estcpu;
 	int		t_lastcpu;	/* affinity: last CPU this thread ran on */
+	/* S424: where the thread *prefers* to run (affinity hint only).
+	 * Ownership (t_oncpu) is a kernel-stack mutex, not affinity - it is
+	 * released once the CPU has switched off the stack, so an idle CPU
+	 * may pick the thread up. */
+	int		t_want_cpu;
 	/* S413: the CPU that currently owns this TCB, -1 when unowned.  A TCB
 	 * is only ever resumed by its owner, which is what stops two CPUs
 	 * from running the same thread (and sharing its kernel stack). */

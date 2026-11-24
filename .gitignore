@@ -50,3 +50,7 @@ __pycache__/
 
 # ---- VMware virtual disks (generated/installed artifacts) ----
 *.vmdk
+
+# ---- BSD yacc/flex host tools (rebuilt by bsd45/tools/build_bsdtools.ps1) ----
+bsd45/tools/bsdsrc/
+bsd45/tools/hostbin/

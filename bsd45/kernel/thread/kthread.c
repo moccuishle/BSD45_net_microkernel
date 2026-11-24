@@ -581,8 +581,21 @@ kthread_user_free(struct kthread *t)
 				break;
 			}
 		}
-		if (t->t_proc->uk_p_nthreads > 0)
-			t->t_proc->uk_p_nthreads--;
+		/*
+		 * S424: do NOT touch uk_p_nthreads here.  The counter means
+		 * "live threads of this process" and has exactly one owner:
+		 * thread_exit_current(), the moment a TCB becomes a zombie.
+		 * Freeing a TCB is a bookkeeping act that can happen much
+		 * later (a joiner, proc_exit teardown) and decrementing again
+		 * there under-counted by one per join, which then made
+		 * kthread_block_tcb() take the "single-threaded, block the
+		 * whole process" shortcut while siblings were still
+		 * runnable, freezing them behind a blocking sibling.
+		 * S424：这里不再改 uk_p_nthreads。它表示"进程还活着的线程数"，
+		 * 只在 thread_exit_current 里递减一次；join/proc_exit 的释放动作
+		 * 可能晚得多，再减一次会让计数提前归零，使 kthread_block_tcb 误判
+		 * 为单线程而阻塞整个进程，把仍在运行的兄弟线程一起冻住。
+		 */
 		if (t->t_proc->uk_p_thread == t)
 			t->t_proc->uk_p_thread = t->t_next;
 	}
@@ -861,6 +874,9 @@ sched_prio_init(struct kthread *t, int base)
 	t->t_sleep_ticks = 0;
 	t->t_starve = 0;
 	t->t_cpu_burst = 0;
+	t->t_ioboost = 0;	/* S424 */
+	t->t_estcpu = 0;	/* S424: per-thread CPU charge */
+	t->t_want_cpu = -1;	/* S424: no affinity preference yet */
 }
 
 /*
@@ -876,8 +892,14 @@ sched_effective_prio(struct kthread *t)
 	if (t == 0)
 		return (PRI_LOWEST);
 	p = t->t_prio;
-	if (t->t_sleep_ticks > 0 && t->t_state == KT_RUN)
-		p += PRI_BOOST_IO;		/* woken I/O thread: interactive */
+	/*
+	 * S424: the interactive boost is a decaying flag, not "has this
+	 * thread ever blocked".  sched_on_wake() arms it when the thread
+	 * really slept, sched_on_tick() burns it down, so a thread that
+	 * blocked once an hour ago no longer outranks everything else.
+	 */
+	if (t->t_ioboost > 0)
+		p += PRI_BOOST_IO;		/* recently woken from sleep */
 	if (t->t_starve >= STARVE_THRESHOLD)
 		p += PRI_BOOST_STARVE;		/* anti-starvation */
 	/* BSD interaction score: high estcpu (CPU hog) and high nice lower
@@ -949,11 +971,19 @@ sched_on_wake(struct kthread *t)
 	/* slept a long time => interactive; reward with short quantum + boost */
 	if (t->t_sleep_ticks > 2) {
 		t->t_quantum = QUANTUM_IO;
+		/*
+		 * S424: arm a timed boost instead of a permanent one.  A
+		 * long sleep is what makes a thread interactive; the boost
+		 * then decays over the next PRI_BOOST_TICKS ticks.
+		 */
+		t->t_ioboost = PRI_BOOST_TICKS;
 	} else if (t->t_cpu_burst >= CPU_BOUND_THRESHOLD) {
 		/* CPU-bound: longer quantum to amortise switch overhead */
 		t->t_quantum = QUANTUM_CPU;
+		t->t_ioboost = 0;
 	} else {
 		t->t_quantum = QUANTUM_BASE;
+		t->t_ioboost = 0;
 	}
 	t->t_cpu_burst = 0;
 	t->t_ticks = 0;
@@ -978,6 +1008,12 @@ sched_on_tick(struct kthread *t)
 	if (t == 0)
 		return;
 	t->t_ticks++;
+	/* S424: the thread is on a CPU, so it is burning CPU, not sleeping */
+	if (t->t_estcpu < ESTCPU_MAX_T)
+		t->t_estcpu++;
+	/* S424: the interactive boost covers the wakeup, then decays away */
+	if (t->t_ioboost > 0)
+		t->t_ioboost--;
 	if (t->t_ticks >= t->t_quantum) {
 		t->t_cpu_burst++;
 		if (t->t_cpu_burst > CPU_BOUND_THRESHOLD)

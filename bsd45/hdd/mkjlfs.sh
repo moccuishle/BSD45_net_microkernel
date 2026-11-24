@@ -601,7 +601,11 @@ for ((ino = 2; ino <= ipg; ino++)); do
         done
     fi
 done
-write_hex_buf "$CG" "$OUT" "$((csaddr * DEV_BSIZE))"
+# write_hex_buf <hex> <byte offset> <image>: hex is the buffer, offset is where
+# it goes.  (This call used to pass the image second, so dd got the path where
+# it expected a number and the cylinder group - the block that carries the JLFS
+# magic and the inode/frag bitmaps - was never written at all.)
+write_hex_buf "$CG" "$((csaddr * DEV_BSIZE))" "$OUT"
 
 # ------------------------------------------------------------------ checks
 if ((next_frag > total_frags)); then
