@@ -288,16 +288,52 @@ ALL SUITES PASSED
    对照实验证明共享 scratch 版同样如此，属键盘工具 / VMware 窗口焦点问题，
    非内核死锁（两版 TRAP 均为 0）。不必按内核 bug 处理。
 
-### 6.2 其它无锁 / 共享数据结构（结构性隐患，均未修）
+### 6.2 其它无锁 / 共享数据结构（结构性隐患，部分已修）
 
 多核审查（见 `os_smp.md` §12）发现的共享队列/链表，当前因大多在 BKL 内或
 尚未被 AP 并发触达而未出问题，但属潜在风险，SMP 全面启用前应逐一评估：
 
-- `defer` 环形队列、`aio` 队列（BKL 外内核线程可能触碰）。
+- `defer` 环形队列、`aio` 队列（BKL 外内核线程可能触碰）。**注**：S429 之后
+  内核线程可在任意核运行，但仍是"全机同一时刻只跑一个"（`kt_active` 票据），
+  所以这两个队列还没有真正并发；要让它们并发必须先给队列自己加锁。
 - `pagecache` / `bufcache` 的 LRU 与 hash 链表（S17 实现，无锁）。
 - `io_uring` 风格环（如已启用）。
-- 运行队列 `rq_head/rq_tail` 与 scratch 窗口已分别由 S418 / S420 修复，不在
-  此列。
+- 运行队列 `rq_head/rq_tail` 与 scratch 窗口已分别由 S418 / S420 修复；
+  用户线程的每核运行队列由 S428 建立（`sc_rqhead/sc_rqlock`）。
+
+### 6.2.1 调度器 / 内核线程现状（S428/S429 后）
+
+- **每核运行队列（#13，S428）**：就绪用户线程挂在唯一一个核的队列上，
+  本地取用 O(1)，空队列时向别的核"偷"（一次遍历），只有在全都找不到时才
+  走 `sched_rq_sweep()` 全表修复扫描（空闲路径，代价可忽略）。状态迁移统一
+  经 `sched_runnable()/sched_unrunnable()`，避免入队与状态位漂移。
+- **内核线程不再绑定 BSP（#11，S429）**：`rq_pop()` 原子出队 + `kt_active`
+  单实例票据，任意核都能跑 softirq/AIO/回收，但仍保持"一次一个 body"的既有
+  语义；AP 只在 idle 路径（CR3=IdlePTD）里 poll，避免在别人的地址空间里跑
+  内核线程。
+
+### 6.2.2 BKL 拆分状态（#10，未完成）
+
+已完成的地基：页分配器有独立 `page_lock`（列表/计数/水位），`proc_alloc()`
+早有 `proc_table_lock`，用户线程运行队列有每核 `sc_rqlock`。加锁顺序
+`BKL → sc_rqlock`、`BKL → page_lock`，无人持队列锁/页锁再取 BKL。
+
+**尚未拆**：系统调用与缺页仍整体持 BKL。VFS、pipe、pmap、fd 表、zcomp、
+pagecache 都还没有自己的锁，所以不能逐个路径"摘掉 BKL"。
+
+一次失败的尝试值得记录（S430 的开发过程）：曾把"单线程进程的堆/栈按需零页"
+做成不走 BKL 的快路径，依据是 `uk_p_nthreads == 1` 时该地址空间只有当前线程、
+不可能同时被人 fork/munmap。压测（`proctest` phase B，1000 个活进程）暴露两个
+后果：先是大面积 `smp: STACK OVERFLOW tid 6`，补上"当前 CR3 必须等于
+`cur->uk_pd`"的判定后变成 triple fault。结论：缺页处理不只是"改一个 PTE"——
+它会在 fork/exec/exit 临时切换过 CR3 的窗口里被触发，也会触碰 COW 引用计数与
+zcomp 状态，这些都还没有自己的锁。**因此缺页路径在 pmap/COW/zcomp 加锁之前
+必须留在 BKL 内**，不要按"单线程就安全"的直觉再试一次。
+
+下一步（按依赖顺序）：①`pmap_lock`（页表页分配 + PTE 写入，含 CR3 归属判定）
+→ ②COW 引用计数与 zcomp 加锁 → ③缺页才能离开 BKL → ④VFS/pipe/fd 表按子系统
+加锁后再放系统调用入口。
+
 
 ### 6.3 调度 / 作业控制功能缺口
 

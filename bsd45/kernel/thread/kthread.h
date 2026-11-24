@@ -103,8 +103,14 @@ struct kthread {
 	 * t_proc points back to the owning kernel process object. */
 	struct process	*t_proc;
 	struct kthread	*t_next;	/* next thread in proc->uk_p_threads list */
-	struct kthread	*t_rqnext;	/* next TCB in the scheduler run queue */
-	int		t_onrq;		/* 1 if currently linked on the run queue */
+	struct kthread	*t_rqnext;	/* next TCB in the kernel-thread run queue */
+	int		t_onrq;		/* 1 if currently linked on that queue */
+	/* S428: per-CPU user run queue link.  A user TCB sits on exactly one
+	 * CPU's queue while it is KT_RUN; t_runq_cpu is that CPU, or -1.  It
+	 * is separate from t_rqnext above because kernel threads (t_proc==0)
+	 * queue globally, and a TCB is only ever one of the two. */
+	struct kthread	*t_runq;
+	int		t_runq_cpu;
 	/* Scheduling: the quantum is per-thread, fairness is per-process. */
 	/* ---- scheduling: dynamic priority, quantum, workload class ---- */
 	int		t_prio;		/* base priority 0(low)..19(high) */

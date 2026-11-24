@@ -250,6 +250,52 @@ static struct kthread *rq_head, *rq_tail;
  * （某个 TCB 槽被写进页目录值）。中断处理不碰这个队列，普通自旋锁足够。
  */
 static struct spinlock rq_lock;
+/*
+ * S429: "one kernel thread body at a time", across all CPUs.
+ *
+ * Kernel threads own subsystem state (the softirq and AIO work queues) that
+ * is not internally locked, so they have always been serialised: only the BSP
+ * polled them, and it ran them one at a time.  Letting any CPU poll is what
+ * makes an idle AP useful, but it must not create concurrency between two
+ * kernel-thread bodies - that would need the per-subsystem locking that is
+ * still on the pending list (#10).  One atomic ticket keeps the old
+ * guarantee and removes the CPU0 bottleneck.
+ *
+ * Released when kthread_poll() returns, i.e. when the thread blocks or exits;
+ * a stranded ticket would mean a kernel thread looped forever, which is the
+ * same hang the BSP-only design had.
+ */
+static volatile int kt_active;
+
+/*
+ * S429: pop the queue head atomically.
+ *
+ * kthread_poll() used to read rq_head and then call rq_dequeue(), which walks
+ * the list under the lock: two CPUs polling at the same time could both see
+ * the same head, and one of them would then dequeue a TCB the other had
+ * already taken.  That was harmless only because polling was BSP-only.  Once
+ * APs poll too (S429) the read and the unlink have to be one critical
+ * section, and the return value says who actually got the thread.
+ */
+static struct kthread *
+rq_pop(void)
+{
+	struct kthread *t;
+
+	spin_lock(&rq_lock);
+	t = rq_head;
+	if (t != 0) {
+		rq_head = t->t_rqnext;
+		if (rq_tail == t)
+			rq_tail = 0;
+		t->t_rqnext = 0;
+		t->t_onrq = 0;
+		if (t->t_proc != 0 && t->t_proc->uk_rq_threads > 0)
+			t->t_proc->uk_rq_threads--;
+	}
+	spin_unlock(&rq_lock);
+	return (t);
+}
 
 /* EN: Enqueue a TCB at the tail of the run queue (idempotent via t_onrq). */
 static void
@@ -414,6 +460,8 @@ kthread_init(void)
 		kthreads[i].t_used = 0;
 		kthreads[i].t_oncpu = -1;
 		kthreads[i].t_reap_cpu = -1;
+		kthreads[i].t_runq = 0;
+		kthreads[i].t_runq_cpu = -1;
 	}
 	printf("kthread: %d thread slots at %x (%d KB stacks)\n", nkthread,
 	    KSTACK_VA, KSTACK_SIZE / 1024);
@@ -465,6 +513,8 @@ kthread_spawn(const char *name, void (*entry)(void *), void *arg)
 	t->t_proc = 0;
 	t->t_oncpu = -1;		/* unowned: any CPU may take it */
 	t->t_reap_cpu = -1;
+	t->t_runq = 0;			/* S428: kernel threads use rq_head */
+	t->t_runq_cpu = -1;
 	t->t_base_ipl = 0;
 	t->t_eff_ipl = 0;
 	t->t_preemptable = 1;
@@ -520,6 +570,8 @@ kthread_user_spawn(struct process *p, int tid)
 	t->t_proc = p;
 	t->t_oncpu = -1;		/* first CPU to claim it runs it */
 	t->t_reap_cpu = -1;
+	t->t_runq = 0;			/* S428: not on a run queue yet */
+	t->t_runq_cpu = -1;
 	t->t_base_ipl = 0;
 	t->t_eff_ipl = 0;
 	t->t_preemptable = 1;
@@ -714,10 +766,13 @@ kthread_poll(void)
 {
 	struct kthread *t;
 
-	t = rq_head;
+	/*
+	 * S429: one atomic pop.  If another CPU got there first the queue is
+	 * empty for us, which is not an error - just nothing to run.
+	 */
+	t = rq_pop();
 	if (t == 0)
 		return;
-	rq_dequeue(t);			/* running: off the queue */
 	/*
 	 * S414 diagnostic: a TCB on the run queue must have a kernel stack in
 	 * the stack pool.  t_ksp == 0 means a user TCB leaked into the kernel
@@ -757,8 +812,15 @@ kthread_run(void)
 {
 	struct kthread *leaving;
 
-	if (cpu_id() != 0)
-		return;
+	/*
+	 * S429: no longer BSP-only.  softirq, AIO and page reclaim used to
+	 * wait for CPU0 to come back through the scheduler; now an idle AP
+	 * takes them, one body at a time (kt_active above).
+	 */
+	if (curk != 0)
+		return;			/* already inside a kernel thread */
+	if (atomic_cmpxchg(&kt_active, 0, 1) != 0)
+		return;			/* another CPU is running one */
 	/*
 	 * kthread_poll() returns to the stack it was called on, which is the
 	 * caller's stack when kthread_run() comes from proc_sched() - not
@@ -773,6 +835,7 @@ kthread_run(void)
 		kthread_poll();
 		kthread_reap(leaving);
 	}
+	(void)atomic_xchg(&kt_active, 0);
 }
 
 /* S414: the current TCB of this CPU (0 when running on the sched stack). */

@@ -389,6 +389,32 @@ struct sched_cpu {
 	struct kthread	*sc_prev;
 	unsigned	sc_tick;	/* S424: per-CPU tick counter (aging cadence) */
 	int		sc_parked;	/* S424: parked in hlt with nothing to run */
+	/*
+	 * S428: this CPU's own run queue.
+	 *
+	 * The scheduler used to pick work by walking all nkthread TCB slots on
+	 * every context switch and every tick, arbitrated only by the claim
+	 * (t_oncpu).  With 1024 slots that is 1024 loads per decision per CPU,
+	 * all of them on cache lines other CPUs are writing, and it gets worse
+	 * with more CPUs - the exact opposite of what SMP is for.
+	 *
+	 * Now every runnable user thread sits on exactly one CPU's queue
+	 * (t_runq_cpu), the local pick is O(1) amortised, and an idle CPU
+	 * *steals* from a busy one instead of scanning the whole table.  The
+	 * table scan survives only as sched_rq_sweep(), the repair pass for a
+	 * state transition that forgot to enqueue - it runs on the idle path,
+	 * where the cost is free and a lost thread would otherwise hang
+	 * forever.
+	 *
+	 * Locking: mutations (put/del) happen on state transitions, which all
+	 * run under the BKL, so they never race each other; the lock exists
+	 * because the *consumer* side (pick/steal) runs from the scheduler and
+	 * from the timer interrupt without the BKL.
+	 */
+	struct kthread	*sc_rqhead;	/* runnable user threads, best-effort */
+	struct kthread	*sc_rqtail;
+	struct spinlock	sc_rqlock;
+	int		sc_nrun;	/* queue length: steal hint */
 	int		sc_online;
 	unsigned	sc_switches;	/* context switches done here */
 };
@@ -459,6 +485,195 @@ sched_wake_idle(void)
 	}
 }
 
+/* ------------------------------------------------------------ S428 queues */
+/* Defined further down with the scheduler; the queue code below needs them. */
+static int tcb_runnable(struct kthread *t);
+static int smt_affinity_score(struct kthread *t, int cid);
+
+/*
+ * Per-CPU run queues.  Every user TCB that is KT_RUN (and whose process may
+ * run) sits on exactly one CPU's queue; t_runq_cpu names it, -1 means "not
+ * queued".  Kernel threads keep their own global queue (rq_head in
+ * kthread.c) because they are runnable regardless of any process state.
+ *
+ * The invariants are enforced by three call sites rather than by every writer:
+ * sched_rq_put() on a transition to KT_RUN, sched_rq_del() on a transition
+ * away from it, and sched_rq_sweep() as the repair pass.  Queue mutation is
+ * serialised by the BKL (all state transitions hold it); the spinlock only
+ * keeps the scheduler's pick/steal from tearing a list another CPU is
+ * walking.  Nobody takes the BKL while holding a queue lock, so the order
+ * BKL -> sc_rqlock is acyclic.
+ */
+#define	RQ_SCAN		32	/* candidates examined per pick (bounded cost) */
+
+static void
+sched_rq_put(struct kthread *t, int cpu)
+{
+	struct sched_cpu *sc;
+
+	if (t == 0 || t->t_proc == 0)	/* kernel threads use rq_head */
+		return;
+	if (cpu < 0 || cpu >= MAXCPU || !sched_cpu[cpu].sc_online)
+		cpu = cpu_id();
+	if (cpu < 0 || cpu >= MAXCPU)
+		cpu = 0;
+	sc = &sched_cpu[cpu];
+	spin_lock(&sc->sc_rqlock);
+	if (t->t_runq_cpu < 0) {
+		t->t_runq = 0;
+		if (sc->sc_rqtail != 0)
+			sc->sc_rqtail->t_runq = t;
+		else
+			sc->sc_rqhead = t;
+		sc->sc_rqtail = t;
+		t->t_runq_cpu = cpu;
+		sc->sc_nrun++;
+	}
+	spin_unlock(&sc->sc_rqlock);
+}
+
+static void
+sched_rq_del(struct kthread *t)
+{
+	struct sched_cpu *sc;
+	struct kthread *p, *prev;
+	int cpu;
+
+	if (t == 0 || (cpu = t->t_runq_cpu) < 0)
+		return;
+	if (cpu >= MAXCPU)
+		cpu = 0;
+	sc = &sched_cpu[cpu];
+	spin_lock(&sc->sc_rqlock);
+	for (p = sc->sc_rqhead, prev = 0; p != 0; prev = p, p = p->t_runq) {
+		if (p != t)
+			continue;
+		if (prev != 0)
+			prev->t_runq = t->t_runq;
+		else
+			sc->sc_rqhead = t->t_runq;
+		if (sc->sc_rqtail == t)
+			sc->sc_rqtail = prev;
+		if (sc->sc_nrun > 0)
+			sc->sc_nrun--;
+		break;
+	}
+	t->t_runq = 0;
+	t->t_runq_cpu = -1;
+	spin_unlock(&sc->sc_rqlock);
+}
+
+/*
+ * Take the best candidate off one CPU's queue.  Scans at most RQ_SCAN entries
+ * so the cost stays bounded even when everything sits at the same priority;
+ * threads owned by another CPU stay queued (their owner will resume them),
+ * and threads whose process may no longer run are left for sched_rq_del().
+ */
+static struct kthread *
+sched_rq_pick(int cpu)
+{
+	struct sched_cpu *sc = &sched_cpu[cpu];
+	struct kthread *p, *best = 0, *bestprev = 0, *prev = 0;
+	int n, best_prio = -1, best_aff = -1;
+
+	spin_lock(&sc->sc_rqlock);
+	for (p = sc->sc_rqhead, n = 0; p != 0 && n < RQ_SCAN;
+	     prev = p, p = p->t_runq, n++) {
+		int prio, aff;
+
+		if (!tcb_runnable(p))
+			continue;
+		if (kthread_owned_by_other(p, cpu))
+			continue;
+		prio = sched_effective_prio(p);
+		aff = smt_affinity_score(p, cpu);
+		if (best == 0 || prio > best_prio ||
+		    (prio == best_prio && aff > best_aff)) {
+			best = p;
+			bestprev = prev;
+			best_prio = prio;
+			best_aff = aff;
+		}
+	}
+	if (best != 0) {
+		if (bestprev != 0)
+			bestprev->t_runq = best->t_runq;
+		else
+			sc->sc_rqhead = best->t_runq;
+		if (sc->sc_rqtail == best)
+			sc->sc_rqtail = bestprev;
+		if (sc->sc_nrun > 0)
+			sc->sc_nrun--;
+		best->t_runq = 0;
+		best->t_runq_cpu = -1;
+	}
+	spin_unlock(&sc->sc_rqlock);
+	return (best);
+}
+
+/* Work stealing: one pass over the other CPUs, stopping at the first hit. */
+static struct kthread *
+sched_rq_steal(int cid)
+{
+	struct kthread *t;
+	int i;
+
+	for (i = 0; i < MAXCPU; i++) {
+		if (i == cid || !sched_cpu[i].sc_online)
+			continue;
+		if (sched_cpu[i].sc_nrun <= 0)
+			continue;	/* unlocked hint only */
+		if ((t = sched_rq_pick(i)) != 0)
+			return (t);
+	}
+	return (0);
+}
+
+/*
+ * Repair pass.  A transition that returned a thread to KT_RUN without
+ * enqueueing it (or one that left it queued after it stopped being runnable)
+ * would otherwise make it invisible: the thread would never be picked again.
+ * Only the idle path calls this, so the O(nkthread) walk costs nothing.
+ */
+static void
+sched_rq_sweep(int cid)
+{
+	int i;
+
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used)
+			continue;
+		if (t->t_state == KT_RUN && t->t_proc != 0) {
+			if (t->t_runq_cpu < 0 && tcb_runnable(t))
+				sched_rq_put(t, cid);
+		} else if (t->t_runq_cpu >= 0)
+			sched_rq_del(t);
+	}
+}
+
+/* Transition helpers: the only places that flip runnability of a user TCB. */
+static void
+sched_runnable(struct kthread *t, int cpu)
+{
+
+	if (t == 0)
+		return;
+	t->t_state = KT_RUN;
+	sched_rq_put(t, cpu);
+}
+
+static void
+sched_unrunnable(struct kthread *t, int state)
+{
+
+	if (t == 0)
+		return;
+	sched_rq_del(t);
+	t->t_state = state;
+}
+
 /*
  * S411: user VA layout, derived from the boot memory plan instead of the
  * old fixed 48 MB heap / 512 MB mmap constants.  Defaults match a 128 MB
@@ -515,11 +730,11 @@ kthread_block_tcb(void *wchan)
 		 * 回复就带着旧 eax 返回。proc_wake() 会恢复 KT_RUN。
 		 */
 		if (t != 0)
-			t->t_state = KT_BLOCK;
+			sched_unrunnable(t, KT_BLOCK);
 		return;
 	}
 	if (t != 0) {
-		t->t_state = KT_BLOCK;
+		sched_unrunnable(t, KT_BLOCK);
 		t->t_wchan = wchan;
 	}
 	/* multi-threaded: keep the process P_RUN so siblings keep running */
@@ -547,7 +762,13 @@ proc_wake(struct process *p)
 		if (t->t_used && t->t_proc == p && t->t_state == KT_BLOCK) {
 			t->t_sleep_ticks++;	/* account wake from sleep/I/O */
 			sched_on_wake(t);	/* boost interactivity, pick quantum */
-			t->t_state = KT_RUN;
+			/*
+			 * S428: queue it where it last ran when that CPU still
+			 * owns the TCB, otherwise locally and let stealing move
+			 * it.  sched_runnable() is the only place that makes a
+			 * user thread visible to the scheduler again.
+			 */
+			sched_runnable(t, t->t_oncpu >= 0 ? t->t_oncpu : cpu_id());
 			t->t_wchan = 0;
 			/*
 			 * S413: the woken thread keeps running on the CPU that
@@ -686,6 +907,14 @@ static void sig_deliver(struct process *, struct sysregs *);
 static struct kthread *fair_pick_next(struct kthread *me);
 static int console_fg_pgrp;
 
+/*
+ * S430: guard for the page allocator.  The free list, the bump pointer and
+ * the counters are global, and user_page_fault() now has a branch that runs
+ * *without* the big kernel lock, so they can no longer rely on it.  This is
+ * the first piece of the BKL split (#10): a subsystem lock that is correct on
+ * its own, so the BKL can be dropped path by path instead of all at once.
+ */
+static struct spinlock	page_lock;
 static unsigned page_free_list;
 static unsigned page_nalloc, page_nfree, page_ninuse;
 
@@ -970,17 +1199,11 @@ page_alloc(void)
 	unsigned pa;
 
 	/*
-	 * Memory-pressure hook: before bumping into more RAM, try to compress
-	 * a few private anonymous pages.  The compressed pages stay in RAM,
-	 * so this trades CPU for headroom instead of going to swap (there is
-	 * no swap device in this port).
-	 * 内存压力钩子：在继续向物理内存推进之前，先压缩少量进程私有匿名页。
-	 * 压缩后的页仍在 RAM 中，用 CPU 换空间，而不是写 swap（本端口没有
-	 * swap 设备）。
+	 * S430: pop under page_lock.  The reclaim hook stays *outside* it -
+	 * zcomp_reclaim() frees pages through page_free(), and taking the lock
+	 * there would self-deadlock on a non-recursive spinlock.
 	 */
-	if (page_free_list == 0 && page_ninuse > (unsigned)reclaim_watermark() &&
-	    !in_zcomp && !in_fault && cur != 0)
-		(void)zcomp_reclaim(8);
+	spin_lock(&page_lock);
 	if (page_free_list != 0) {
 		unsigned *p = map_page(SCRATCH_PAGE, page_free_list);
 
@@ -989,6 +1212,34 @@ page_alloc(void)
 		page_nalloc++;
 		page_ninuse++;
 		page_ref_set(pa, 1);
+		spin_unlock(&page_lock);
+		return (pa);
+	}
+	spin_unlock(&page_lock);
+
+	/*
+	 * Memory-pressure hook: before bumping into more RAM, try to compress
+	 * a few private anonymous pages.  The compressed pages stay in RAM,
+	 * so this trades CPU for headroom instead of going to swap (there is
+	 * no swap device in this port).
+	 * 内存压力钩子：在继续向物理内存推进之前，先压缩少量进程私有匿名页。
+	 * 压缩后的页仍在 RAM 中，用 CPU 换空间，而不是写 swap（本端口没有
+	 * swap 设备）。
+	 */
+	if (page_ninuse > (unsigned)reclaim_watermark() &&
+	    !in_zcomp && !in_fault && cur != 0)
+		(void)zcomp_reclaim(8);
+
+	spin_lock(&page_lock);
+	if (page_free_list != 0) {
+		unsigned *p = map_page(SCRATCH_PAGE, page_free_list);
+
+		pa = page_free_list;
+		page_free_list = *p;
+		page_nalloc++;
+		page_ninuse++;
+		page_ref_set(pa, 1);
+		spin_unlock(&page_lock);
 		return (pa);
 	}
 	pa = next_pa;
@@ -1007,6 +1258,7 @@ page_alloc(void)
 	page_nalloc++;
 	page_ninuse++;
 	page_ref_set(pa, 1);
+	spin_unlock(&page_lock);
 	return (pa);
 }
 
@@ -1019,6 +1271,7 @@ page_free(unsigned pa)
 
 	if (pa == 0 || (pa & (PAGE_SIZE - 1)) != 0)
 		return;
+	spin_lock(&page_lock);
 	p = map_page(SCRATCH_PAGE, pa);
 	*p = page_free_list;
 	page_free_list = pa;
@@ -1026,6 +1279,7 @@ page_free(unsigned pa)
 	page_nfree++;
 	if (page_ninuse > 0)
 		page_ninuse--;
+	spin_unlock(&page_lock);
 }
 
 /*
@@ -3221,6 +3475,7 @@ proc_table_init(void)
 
 	user_layout_init();
 	spin_init(&proc_table_lock);
+	spin_init(&page_lock);
 	procs = (struct process *)kern_table_alloc((unsigned)PROC_TABLE_VA,
 	    (unsigned)NPROC * (unsigned)sizeof(struct process));
 	printf("usermode: %d proc slots at %x (%d KB)\n", NPROC,
@@ -3355,6 +3610,7 @@ sched_percpu_init(int id, unsigned stack_top)
 		return;
 	t = &per_cpu_idle[id];
 	bzero(t, sizeof(*t));
+	t->t_runq_cpu = -1;		/* S428: carriers are never queued */
 	t->t_state = KT_RUN;
 	t->t_tid = -1;
 	t->t_name = "idle";
@@ -3370,6 +3626,11 @@ sched_percpu_init(int id, unsigned stack_top)
 	sched_cpu[id].sc_cur_pd = 0;
 	sched_cpu[id].sc_need_resched = 0;
 	sched_cpu[id].sc_switches = 0;
+	/* S428: this CPU's run queue starts empty */
+	sched_cpu[id].sc_rqhead = 0;
+	sched_cpu[id].sc_rqtail = 0;
+	sched_cpu[id].sc_nrun = 0;
+	spin_init(&sched_cpu[id].sc_rqlock);
 	sched_cpu[id].sc_online = 1;
 	hal_kernel_stack_set(t->t_stack_top);
 }
@@ -3471,8 +3732,16 @@ proc_sched(void)
 		/*
 		 * S21: kernel threads (softirq, page reclaim, IRP workers)
 		 * get their own execution carrier first.
+		 *
+		 * S429: only the BSP does this *before* user dispatch.  An AP
+		 * reaches this point with the previous thread's CR3 still
+		 * loaded, and a kernel thread that touches a user buffer would
+		 * then run in the wrong address space.  APs poll from the idle
+		 * path below instead, where CR3 is IdlePTD - the same context
+		 * the BSP has always used for them.
 		 */
-		kthread_run();
+		if (cid == 0)
+			kthread_run();
 		/*
 		 * S25: the scheduler walks threads, not processes.  Each
 		 * user thread names its address-space container through
@@ -3542,12 +3811,25 @@ proc_sched(void)
 					smp_bkl_drop();
 					sched_cpu[cid].sc_switches++;
 					idle_reported = 0;	/* dispatched */
+					/*
+					 * S428: this CPU is leaving the caller
+					 * (mt).  It is still KT_RUN, so it has
+					 * to be on somebody's run queue before we
+					 * switch away - otherwise it would only
+					 * come back through the repair sweep.
+					 */
+					if (mt != 0 && mt != t &&
+					    mt->t_state == KT_RUN)
+						sched_rq_put(mt, cid);
 					/* S424: release mt on the next entry */
 					sched_cpu[cid].sc_prev = mt;
 					sched_cpu[cid].sc_parked = 0;
 					resume_user(pd_to_load, regs);
 				}
 				kthread_release_cpu(t);	/* sig_deliver killed it */
+			} else if (t != 0) {
+				/* S428: claim lost (or sig killed it): requeue */
+				sched_rq_put(t, cid);
 			}
 		}
 		if (me != 0 && mt != 0 && mt->t_state == KT_RUN &&
@@ -3943,53 +4225,30 @@ smt_affinity_score(struct kthread *t, int cid)
  * and priority-inherited threads get boosted; CPU-bound threads stay low.
  * estcpu and SMT affinity break ties so a process with many threads cannot
  * dominate and a thread prefers the CPU (or physical core) it last used.
+ *
+ * S428: the candidates now come from the per-CPU run queues instead of a walk
+ * over the whole TCB table: this CPU's own queue first (O(1) amortised), then
+ * one stealing pass over the other queues, and only if both come up empty the
+ * repair sweep costs an O(nkthread) walk to make sure nothing was lost.  The
+ * normal steady state never touches another CPU's cache lines.
  */
 static struct kthread *
 fair_pick_next(struct kthread *me)
 {
-	struct kthread *best = 0;
-	int best_prio = -1, best_aff = -1, i, start;
+	struct kthread *t;
 	int cid = cpu_id();
 
-	/*
-	 * S424: `me` may be a per-CPU idle carrier, which does not live in
-	 * the TCB pool - index arithmetic on it would produce a meaningless
-	 * rotation offset, so only use it when it really is a pooled TCB.
-	 */
-	start = 0;
-	if (me != 0 && me >= kthreads && me < kthreads + nkthread)
-		start = (int)(me - kthreads);
-	for (i = 0; i < nkthread; i++) {
-		struct kthread *t = &kthreads[(start + i + 1) % nkthread];
-		int prio, aff;
-
-		if (t == me || !tcb_runnable(t))
-			continue;
-		/*
-		 * S413: a TCB owned by another CPU is not a candidate here.
-		 * This single test is what turns one shared scan into N
-		 * independent per-CPU dispatchers: every CPU walks the same
-		 * table, but each may only take threads nobody owns, so the
-		 * CPUs naturally spread over the runnable set.
-		 * S413：属于别的核的 TCB 不是本核的候选。就是这一句把一个共享扫描
-		 * 变成了 N 个独立的每核分发器：所有核走同一张表，但只能领没人占的
-		 * 线程，于是自然分摊到不同核上。
-		 */
-		if (kthread_owned_by_other(t, cid))
-			continue;
-		prio = sched_effective_prio(t);
-		aff = smt_affinity_score(t, cid);
-		if (best == 0 || prio > best_prio ||
-		    (prio == best_prio &&
-		     (aff > best_aff ||
-		      (aff == best_aff &&
-		       t->t_proc->uk_estcpu < best->t_proc->uk_estcpu)))) {
-			best = t;
-			best_prio = prio;
-			best_aff = aff;
-		}
-	}
-	return (best);
+	(void)me;		/* the caller's TCB is never on a queue */
+	if (cid < 0 || cid >= MAXCPU)
+		return (0);
+	if ((t = sched_rq_pick(cid)) != 0)
+		return (t);
+	if ((t = sched_rq_steal(cid)) != 0)
+		return (t);
+	sched_rq_sweep(cid);
+	if ((t = sched_rq_pick(cid)) != 0)
+		return (t);
+	return (0);
 }
 
 /* 中文：时钟中断抢占处理：保存被中断用户线程的上下文，按进程公平选中下一线程并改写中断帧，iret 直接进入新线程 */
@@ -4084,10 +4343,19 @@ sched_tick(struct sysregs *r)
 		int me_prio = sched_effective_prio(me);
 		int next_prio = (t != 0) ? sched_effective_prio(t) : PRI_LOWEST;
 		int quantum_expired = (me->t_ticks >= me->t_quantum);
+
 		/* higher-priority next preempts immediately (no wait for quantum) */
 		if (t == 0 || (!quantum_expired && !need_resched &&
-		               next_prio <= me_prio))
+		               next_prio <= me_prio)) {
+			/*
+			 * S428: fair_pick_next() took `t` off a run queue.
+			 * Keeping the current thread means putting it back,
+			 * otherwise the candidate stays invisible until the
+			 * next repair sweep.
+			 */
+			sched_rq_put(t, cpu_id());
 			return;			/* keep running current thread */
+		}
 	}
 	need_resched = 0;
 	if (t == 0) {
@@ -4109,6 +4377,8 @@ sched_tick(struct sysregs *r)
 	 * 当前线程，绝不让两个核同时落在一个内核栈上。
 	 */
 	if (!kthread_claim_cpu(t, cpu_id())) {
+		/* S428: lost the race for a queued thread - put it back */
+		sched_rq_put(t, cpu_id());
 		if (me->t_tid == mp->uk_pid)
 			mp->uk_regs = *r;
 		else
@@ -4133,6 +4403,13 @@ sched_tick(struct sysregs *r)
 		cur_pd = p->uk_pd;
 	hal_kernel_stack_set(t->t_stack_top);
 	*r = *regs;
+	/*
+	 * S428: the preempted thread is still KT_RUN, so it has to go back on a
+	 * run queue before this CPU leaves its stack - another CPU may pick it
+	 * up straight away.  (The idle carrier has t_proc == 0, so it is
+	 * ignored by the queue code.)
+	 */
+	sched_rq_put(me, cpu_id());
 	/* S424: this CPU is about to leave me's stack - release it next entry */
 	sched_cpu[cpu_id()].sc_prev = me;
 	sched_cpu[cpu_id()].sc_parked = 0;
@@ -4192,7 +4469,7 @@ do_fork(struct sysregs *r)
 	 * 没有核能派发它；这里置 KT_RUN 是子进程对所有调度器可见的唯一时刻。
 	 */
 	if (p->uk_p_thread != 0)
-		p->uk_p_thread->t_state = KT_RUN;
+		sched_runnable(p->uk_p_thread, cpu_id());
 	sched_kick_other();		/* let an idle AP take the child now */
 
 	return (p->uk_pid);
@@ -4236,7 +4513,7 @@ do_vfork(struct sysregs *r)
 	p->uk_vfork_child = 1;
 	/* S413: same publish-last rule as do_fork(). */
 	if (p->uk_p_thread != 0)
-		p->uk_p_thread->t_state = KT_RUN;
+		sched_runnable(p->uk_p_thread, cpu_id());
 	sched_kick_other();
 
 	/* the parent blocks until the child execs or exits */
@@ -4375,7 +4652,7 @@ proc_exit(int code)
 
 		if (!t->t_used || t->t_proc != cur || t == cur_thread)
 			continue;
-		t->t_state = KT_ZOMBIE;
+		sched_unrunnable(t, KT_ZOMBIE);	/* S428: off the queue */
 	}
 	if (!addrspace_quiesce(cur)) {
 		/*
@@ -4505,7 +4782,7 @@ user_fault(int sig, unsigned eip, unsigned va)
 		struct kthread *t = &kthreads[i];
 
 		if (t->t_used && t->t_proc == cur && t->t_tid != cur->uk_pid) {
-			t->t_state = KT_ZOMBIE;
+			sched_unrunnable(t, KT_ZOMBIE);
 			t->t_exitcode = 128 + sig;
 		}
 	}
@@ -5338,7 +5615,8 @@ thread_create(struct sysregs *r)
 	t->t_regs.ebp = 0;
 	t->t_sigmask = (cur_thread != 0) ? cur_thread->t_sigmask :
 	    cur->uk_p_sigmask;
-	t->t_state = KT_RUN;
+	/* S428: publish through the queue, see sched_runnable() */
+	sched_runnable(t, cpu_id());
 	/* kthread_user_spawn already linked t and bumped uk_p_nthreads */
 	return (tid);
 }
@@ -5373,7 +5651,7 @@ thread_exit_current(int code)
 		t->t_exitcode = code;
 		hal_address_space_activate((unsigned)IdlePTD);
 		cur_pd = (unsigned)IdlePTD;
-		t->t_state = KT_ZOMBIE;
+		sched_unrunnable(t, KT_ZOMBIE);	/* S428 */
 		prio_restore(t);
 		proc_sched();			/* zombie: not resumable */
 		return;
@@ -5392,7 +5670,7 @@ thread_exit_current(int code)
 	hal_address_space_activate((unsigned)IdlePTD);
 	cur_pd = (unsigned)IdlePTD;
 	t->t_exitcode = code;
-	t->t_state = KT_ZOMBIE;
+	sched_unrunnable(t, KT_ZOMBIE);	/* S428: off the queue */
 	/* release inherited priority: the resource (this thread) is done */
 	prio_restore(t);
 	cur->uk_p_nthreads--;		/* S424: single owner of this counter */
@@ -5419,7 +5697,8 @@ thread_exit_current(int code)
 			proc_wake(j->t_proc);
 		} else {
 			j->t_regs.eax = code;
-			j->t_state = KT_RUN;
+			sched_runnable(j, j->t_oncpu >= 0 ? j->t_oncpu :
+			    cpu_id());
 		}
 	}
 	if (t->t_detached) {
@@ -5487,7 +5766,7 @@ thread_join(int tid, struct sysregs *r)
 		kthread_block_tcb(0);
 	} else {
 		jt->t_regs = *r;
-		jt->t_state = KT_BLOCK;
+		sched_unrunnable(jt, KT_BLOCK);
 	}
 	proc_sched();
 	return (0);
@@ -6840,7 +7119,8 @@ bsd45_syscall(struct sysregs *r)
 		}
 		t->t_sig |= SIG_TO_MASK(sig);
 		if (t->t_state == KT_BLOCK)
-			t->t_state = KT_RUN;
+			sched_runnable(t, t->t_oncpu >= 0 ? t->t_oncpu :
+			    cpu_id());
 		proc_wake(t->t_proc);
 		r->eax = 0;
 		break;
@@ -7118,7 +7398,7 @@ start_prog(const char *path, const char *script)
 		hal_kernel_stack_set(cur->uk_p_thread->t_stack_top);
 		/* S413: the pid-1 TCB becomes runnable only now that its
 		 * address space, stack and registers are all in place. */
-		cur->uk_p_thread->t_state = KT_RUN;
+		sched_runnable(cur->uk_p_thread, cpu_id());
 		/*
 		 * S413: and it belongs to the CPU that is about to run it.
 		 * enter_user() below jumps straight into ring 3 without going
