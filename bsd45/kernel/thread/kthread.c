@@ -159,6 +159,24 @@ kthread_owned_by_other(struct kthread *t, int id)
 static int		nreap[MAXCPU];
 
 /*
+ * Record that t may only be published by `owner` after that CPU has switched
+ * off t's kernel stack.  This deliberately does NOT take the pool lock:
+ * kthread_user_free() runs under the BKL, while tcb_reserve() holds the pool
+ * lock across kstack_alloc()/page_alloc()/pmap_map(); taking it here would
+ * create a BKL <-> pool-lock inversion (observed as a hard hang when a
+ * pthread created and joined threads).  The slot is published with an atomic
+ * store instead, see kthread_reap().
+ */
+static void
+kthread_defer_reap(struct kthread *t, int owner)
+{
+
+	t->t_reap_cpu = owner;
+	if (nreap[owner] < nkthread)
+		nreap[owner]++;
+}
+
+/*
  * Publish the slots that were released by a thread which is still running on
  * its own kernel stack.
  *
@@ -186,18 +204,28 @@ kthread_reap(struct kthread *leaving)
 		return;
 	for (i = 0; i < nkthread && nreap[id] > 0; i++) {
 		struct kthread *t = &kthreads[i];
+		int tid;
 
-		if (!t->t_used || t->t_reap_cpu != id)
+		if (!t->t_used || t->t_reap_cpu != id || t == leaving)
 			continue;
-		if (t == leaving)
-			continue;	/* this CPU is still on that stack */
-		if (smpdbg)
-			printf("smp: reap cpu%d slot %d tid %d\n", id, i, t->t_tid);
+		/*
+		 * Publish WITHOUT the pool lock: kthread_user_free() may run
+		 * under the BKL while tcb_reserve() holds the pool lock across
+		 * page allocation, so taking it here can deadlock.  On x86
+		 * stores are observed in program order and atomic_xchg() is a
+		 * full barrier, so writing every field first and publishing
+		 * t_used last means a CPU that sees t_used == 0 also sees the
+		 * cleared t_oncpu/t_state/t_reap_cpu.  tcb_reserve() can then
+		 * bzero the TCB and the 16 KB stack safely.
+		 */
+		tid = t->t_tid;
 		t->t_reap_cpu = -1;
-		t->t_used = 0;
 		t->t_oncpu = -1;
 		t->t_state = KT_FREE;
+		atomic_xchg(&t->t_used, 0);	/* publish: slot is free now */
 		nreap[id]--;
+		if (smpdbg)
+			printf("smp: reap cpu%d slot %d tid %d\n", id, i, tid);
 	}
 }
 
@@ -540,6 +568,7 @@ void
 kthread_user_free(struct kthread *t)
 {
 	struct kthread **pp;
+	int owner;
 
 	if (t == 0)
 		return;
@@ -561,21 +590,36 @@ kthread_user_free(struct kthread *t)
 	t->t_proc = 0;
 	t->t_next = 0;
 	/*
-	 * S413: if this CPU is running on this very TCB's stack, the slot
-	 * cannot be handed out yet - see kthread_reap().
+	 * Never publish a slot while a CPU can still be executing on its
+	 * stack.  That covers two cases:
+	 *   - the caller itself (t == cur_thread) is about to enter the
+	 *     scheduler on this very stack;
+	 *   - a joiner frees a KT_ZOMBIE whose owner CPU has not reached
+	 *     proc_sched() yet (t_oncpu still names that CPU).  The old
+	 *     code only tested the first case, so thread_join() could
+	 *     publish a stack that the exiting CPU was still using.
+	 * Hand the slot to the owning CPU; kthread_reap() publishes it
+	 * only after that CPU has switched off this stack.
 	 */
-	if (t == cur_proc_kthread()) {
+	if (t == cur_proc_kthread())
+		owner = cpu_id();
+	else
+		owner = t->t_oncpu;
+	if (owner >= 0) {
 		if (smpdbg)
-			printf("smp: defer cpu%d slot %d tid %d\n", cpu_id(),
+			printf("smp: defer cpu%d slot %d tid %d\n", owner,
 			    (int)(t - kthreads), t->t_tid);
-		t->t_reap_cpu = cpu_id();
-		if (nreap[cpu_id()] < nkthread)
-			nreap[cpu_id()]++;
+		kthread_defer_reap(t, owner);
 		return;
 	}
-	t->t_used = 0;
+	/*
+	 * Unowned TCB (already off its stack).  Same lock-free publication
+	 * rule as kthread_reap(): all fields first, t_used last via an
+	 * atomic exchange.
+	 */
 	t->t_oncpu = -1;
 	t->t_reap_cpu = -1;
+	atomic_xchg(&t->t_used, 0);
 }
 
 /* 中文：阻塞当前内核线程，置为 KT_BLOCK 并切换回调度栈 */
@@ -624,16 +668,14 @@ kthread_exit(void)
 	 * slot, bzero it and hand the very same stack to a new thread, which
 	 * would then run with two CPUs inside it.  Hand the slot to the
 	 * deferred reap instead - it publishes only after this CPU has
-	 * switched off the stack (kthread_run() calls kthread_reap(0) right
-	 * after kthread_poll() returns).
+	 * switched off the stack (kthread_run() calls kthread_reap() with
+	 * the caller's TCB right after kthread_poll() returns).
 	 * S414：不在这里放开槽位。本核还跑在 t 的内核栈上，另一个核 fork 时
 	 * 可能抢到该槽、bzero 它并把同一张栈交给新线程，两核就同栈了。改为交给
-	 * 延迟回收，等本核切走（kthread_run 在 poll 返回后调 kthread_reap(0)）
-	 * 再发布。
+	 * 延迟回收，等本核切走（kthread_run 在 poll 返回后用调用者的 TCB 调
+	 * kthread_reap）再发布。
 	 */
-	t->t_reap_cpu = cpu_id();
-	if (nreap[cpu_id()] < nkthread)
-		nreap[cpu_id()]++;
+	kthread_defer_reap(t, cpu_id());
 	hal_switch_stack(&t->t_ksp, sched_esp[cpu_id()]);
 	for (;;)
 		;
@@ -700,17 +742,23 @@ kthread_poll(void)
 void
 kthread_run(void)
 {
+	struct kthread *leaving;
 
 	if (cpu_id() != 0)
 		return;
+	/*
+	 * kthread_poll() returns to the stack it was called on, which is the
+	 * caller's stack when kthread_run() comes from proc_sched() - not
+	 * necessarily the per-CPU scheduler stack.  Passing 0 here claimed
+	 * "this CPU is on no TCB stack" and let the reaper publish (and
+	 * kstack_alloc() bzero) the very stack proc_sched() was running on,
+	 * which shows up as a triple fault once a deferred join/detach slot
+	 * is pending.  Name the caller's TCB instead so it is skipped.
+	 */
+	leaving = cur_proc_kthread();
 	while (kthread_runnable()) {
 		kthread_poll();
-		/*
-		 * poll returning means this CPU is back on sched_esp, i.e.
-		 * it no longer runs on the exiting thread's stack.  Only now
-		 * may that slot be handed out again.
-		 */
-		kthread_reap(0);
+		kthread_reap(leaving);
 	}
 }
 

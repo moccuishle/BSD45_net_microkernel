@@ -5009,6 +5009,19 @@ thread_exit_current(int code)
 		proc_sched();
 		return;
 	}
+	/*
+	 * Leave the user address space BEFORE publishing KT_ZOMBIE.  The main
+	 * thread may free the whole address space as soon as thread_join()
+	 * observes the zombie state; if this CPU then sat in proc_sched()
+	 * with the process CR3 still loaded, the page-directory page would
+	 * already be back in the allocator.  A later trap would fault while
+	 * fetching _Xpage itself (the kernel PDE 0x3f8 is only present while
+	 * the PD is alive), escalating to a double/triple fault - exactly the
+	 * pthpre-exit crash.  Publish the zombie state only after CR3 is on
+	 * the kernel directory.
+	 */
+	hal_address_space_activate((unsigned)IdlePTD);
+	cur_pd = (unsigned)IdlePTD;
 	t->t_exitcode = code;
 	t->t_state = KT_ZOMBIE;
 	/* release inherited priority: the resource (this thread) is done */
@@ -5030,7 +5043,14 @@ thread_exit_current(int code)
 		}
 	}
 	if (t->t_detached) {
-		cur_thread = 0;
+		/*
+		 * Keep cur_thread == t across the free so kthread_user_free()
+		 * takes the deferred path.  proc_sched() below keeps running
+		 * on t's 16 KB stack; clearing cur_thread first (as the old
+		 * code did) defeated the "this CPU is still on that stack"
+		 * check and let a concurrent tcb_reserve()+kstack_alloc()
+		 * bzero a live stack - the detached-thread form of TRAP 12.
+		 */
 		kthread_user_free(t);
 	}
 	proc_sched();
