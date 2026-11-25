@@ -1,9 +1,14 @@
 # BSD45-ELF-x86 任务恢复文本（入口 + 缓存系统 S17）
 
-更新时间：2026-11-17（Asia/Shanghai）
-状态：**os.md 机制 1/2/3/4/5 已落地**（IPL/抢占、COW、demand paging、
-内存压缩、VFS 同步/异步 + SQ/CQ 环）；`tools/all_tests.sh` **全部套件 PASSED**。
-仓库：https://github.com/moccuishle/BSD_object_orient_kernel
+更新时间：2026-11-26（Asia/Shanghai）
+状态：**S0–S17 全部落地**；当前工作在 **P2（BKL 拆分）**：VFS / pipe /
+page cache / buffer cache / name cache / fd 表均已分锁，**普通文件 `read(2)`
+已离开 BKL**（§6.2.9），其余系统调用仍在 BKL 内。
+仓库：https://github.com/moccuishle/BSD45_multi_core_process （5 仓同步，见 §0.4）
+
+> **新机器请直接跳到 [§0.4 新机器快速恢复](#04-新机器快速恢复2026-11-26)**：
+> 克隆 5 仓、装工具链、构建、跑全套验收、以及"上次停在哪、下一步做什么"。
+> 下一步的具体动作见 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)。
 
 > 本文件是恢复入口，并**合并了原 `恢复.md`**（4.5BSD VFS/VM 缓存层盘点与路线）。
 > 完整的 S0–S17 功能记录、43+ 条踩坑、构建脚本细节在
@@ -33,6 +38,77 @@
 
 如果要继续整理，可做 `arch/legacy`（hp300/vax 等空占位）或
 `fs/legacy`、`net/proto` 的归并。
+
+### 0.4 新机器快速恢复（2026-11-26）
+
+**① 拉代码（5 个仓，树必须一致）**
+
+| 仓 | 用途 |
+|---|---|
+| `git@github.com:moccuishle/BSD45_multi_core_process.git` | 主仓（开发在这里） |
+| `git@github.com:moccuishle/BSD45_multiprocess_allocation.git` | 镜像 |
+| `git@github.com:moccuishle/BSD45_net_microkernel.git` | 镜像 |
+| `git@github.com:moccuishle/BSD45_device_microkernel.git` | 镜像 |
+| `git@github.com:moccuishle/BSD45_microkernel.git` | 镜像 |
+
+- 只开发主仓；4 个镜像仓用 `commit-tree` 生成同树提交后快进推送（§7.0）。
+- SSH 22 端口在国内常被拒：`~/.ssh/config` 里给 `github.com` 指定
+  `HostName ssh.github.com` / `Port 443` 即可。
+- 上次停下的位置：主仓 `2844c02`，树 `261ddce`（5 仓一致）。
+
+**② 装工具链**：按 [`ai_install_gccenv.md`](ai_install_gccenv.md) 装 MSYS2
+（`C:\msys64`）+ `mingw-w64-ucrt-x86_64-gcc` / `mingw-w64-i686-gcc` /
+`qemu` / `bison` / `flex` / `xorriso`。本文档里有全部踩过的坑（TUNA 的 i686
+路径 404、`ParallelDownloads`、`SigLevel`、i686 用 `mirror.msys2.org` 等）。
+
+**③ 构建（Windows 只用 PowerShell，bash 留给 Ubuntu）**
+
+```powershell
+cd bsd45
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_all.ps1   # 内核+用户态+ISO
+# 单步：build_kernel.ps1 / build_sh.ps1 / build_iso.ps1
+```
+
+- 产物：`bsd45/out/BSD45-ELF-x86.iso`（约 16.2 MB）、`bsd45/build/bsd45.elf`。
+- **不要**在 bash 里跑 `build_all.sh`：`MINGW_BIN` 这类变量会被环境层过滤，
+  且 `ld` 接 140 个 `.o` 会崩；PowerShell 链已改用 `@response.rsp`。
+
+**④ 跑验收**
+
+```powershell
+cd bsd45
+$tests = @('test_s3','test_s4','test_proc','test_tty','test_s7','test_s8','test_s9',
+  'test_s10','test_sig','test_s10_3','test_s10_4','test_dev','test_tools',
+  'test_mount','test_ps','test_cache','test_mmap','test_subsys','test_kthread',
+  'test_pthread','test_wpath','test_ipl','test_preempt','test_cow','test_fault',
+  'test_badptr')
+foreach ($t in $tests) {
+  $out = & powershell -NoProfile -ExecutionPolicy Bypass -File (".\tools\" + $t + ".ps1") 2>&1
+  $m = $out | Select-String -Pattern 'PASSED|FAILED' | Select-Object -Last 1
+  "{0,-14} {1}" -f $t, ($m ? $m.Line.Trim() : 'NO VERDICT')
+}
+```
+
+**期望基线：25 PASS + 2 套已知失效**（`test_subsys` / `test_ipl` 依赖
+`36a84a1` 已删除的 subsys personality 与 16 级 IPL monitor 命令，不是回归）。
+
+```bash
+# 8 核混合基线（PATH 里要有 qemu-system-i386）
+cd bsd45
+python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 --timeout 600 \
+  --boot-wait 60 --cmd smpon --cmd smpuser --cmd "shell+8" \
+  --cmd "/bin/pthread+30" --cmd "/bin/rdstress+45" --cmd "/bin/pthpre+30" \
+  --cmd "/bin/aiotest+30" --cmd ps --cmd "exit 0" \
+  --log C:/tmp/reg8.log
+```
+
+**判读要点**
+- `-d cpu_reset` 抓 triple fault；日志里 `TRAP`/`STACK OVERFLOW`/
+  `address space busy` 出现即失败。
+- qdrive 偶发报 `boot timeout (no monitor prompt)` 后命令静默丢弃：这是 TCG
+  启动抖动，先看日志是否已经跑完再判断死锁。
+- ISO 内程序名必须是**大写程序名 + `.ELF`**（`/bin/rdstress` → `RDSTRESS.ELF`），
+  否则 shell 报 `not found`。
 
 ---
 
@@ -213,6 +289,10 @@ ALL SUITES PASSED
 - [`docs/kernel-boundary.md`](docs/kernel-boundary.md)：内核边界与原语契约（S100.1）
 - [`docs/microkernel-design.md`](docs/microkernel-design.md)：微内核设计（S100.2）
 - [`shell.md`](shell.md)：PowerShell → bash 的固化写法与避坑
+- [`os_lock_preempt.md`](os_lock_preempt.md)：**锁设计方法论 + BSD45 的 IRQL/
+  preempt 改造方案**（锁的对象是"执行流 × 共享状态"、五步决策链、执行流 ×
+  数据锁选择矩阵、BSD45 现状与改造路线、风险与验收清单、代码引用索引）。
+  去掉 BKL 之前先读它，尤其是"哪些地方不能被抢占、哪些地方不能被锁"。
 
 ---
 
@@ -635,6 +715,16 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
   3. 重跑 7.0 全套 + 15 套验收，特别验证**不发 `smpuser`** 的默认启动路径。
 - **验收**：数小时 0 次 TRAP 12 / triple fault / kernel TRAP；默认启动下
   `ps` 与多线程测试仍 PASS，cpu1–cpu7 都参与调度。
+
+- **已积累的 soak 证据（2026-11-26，仍未到"数小时"）**：
+  - 03:20-04:05：6 轮 × 24 循环，130 个循环，0 异常；
+  - 05:43-06:36（53 分钟）：8 轮 × 24 循环 = **192 个循环 × 6 条命令**，
+    boot3 夹 `proctest` 到 phase B（1002 live），**0 个 TRAP / triple fault /
+    STACK OVERFLOW / address space busy**；
+  - 累计约 1.5 小时。脚本 `soak_p1.sh`（在 WorkBuddy workspace，
+    参数：轮数、每轮循环数；正式跑用 `bash soak_p1.sh 20 30` ≈ 3 小时）。
+    注意：qdrive 的 `--log` 是追加写，每轮前脚本已清空；整轮只开一个 shell，
+    不要每轮 `exit`。
 - **坑**：若 soak 中复现，按 `os_smp.md` §12/§15 的反汇编方法
   （`cmpl $1,(%eax)`、崩溃点 `cpus[cid].ci_curthread`）重新取证；**不要靠
   "再加一把锁"规避**——S422 就是池锁 vs BKL 锁序反转导致硬死锁（时钟静止）。
@@ -647,8 +737,9 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 > **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache、
 > name cache、fd 表都已加锁；**普通文件 `read(2)` 已摘掉 BKL**（§6.2.9），
 > 其余系统调用仍在 BKL 内。
-> 下一步：把 `read` 的其它 fd 类型与 `write` 逐个移出 BKL，然后是 open/close
-> （要连带 namei 的路径级锁）；`smp_user_dispatch` 默认值仍为 0。
+> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**：按
+> lseek → fstat → /dev 伪文件 → tmpfs → pipe → console → open/close 的顺序
+> 一条条摘；`smp_user_dispatch` 默认值仍为 0，等 3 小时 soak。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近
@@ -678,6 +769,44 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 - **坑**：S430 两次失败都源于"以为只改一个 PTE / 一条链就安全"。fork / exec /
   exit 会在 BKL 内临时切走 CR3，缺页与系统调用必须整体看待；`in_fault`
   必须保持每 CPU（`in_fault_cpu[MAXCPU]`），否则 A 核的缺页保护会被 B 核清掉。
+
+#### 7.2.1 下一步（可直接动手，2026-11-26 交接）
+
+已经做完的：`vfs_lock`（vnode 池）、`pipe_lock`、`pc_lock`（页缓存）、
+`bio_lock`（缓冲缓存）、`nc_lock`（名字缓存）、`fd_lock`，以及**普通文件
+`read(2)` 摘掉 BKL**（§6.2.9）。下面按"风险从低到高、每次只动一条路径"排好序，
+**每做完一条都要跑 §0.4 的全套 27 套 + 8 核基线，再进下一条**。
+
+1. **`lseek`（最小一步，纯 fd 表）**：`usermode.c` 里 `lseek` 只改
+   `uk_fds[fd].off`，套上 `fd_lock` 后即可 `smp_bkl_drop()`。做完这条就有了
+   "两条路径离开 BKL"的模板。
+2. **`fstat` / `stat`**：只读 vnode 的 `getattr`，vnode 已由 `vfs_lock` 保护；
+   注意 `stat` 还走 namei（先别摘，只摘 `fstat`）。
+3. **`/dev` 伪文件 read**：`FD_ZERO`/`FD_NULL`/`FD_VMSTAT`/`FD_MOUNTS`/
+   `FD_PS`。它们的输出落在文件作用域静态缓冲（`ps_snap_buf`、`mbuf`、
+   `vbuf`），**必须先加一把 `devbuf_lock`**，否则两个进程同时读会互相踩。
+4. **tmpfs 文件 read/write**：`FD_TMPFILE` 直接读写 `tmpfs[].data`，要先给
+   tmpfs 节点加锁（或在 `pagecache_purge_vp` 之外引入节点锁），别忘了
+   `n->size` 与 `data` 的分配是分开的两步。
+5. **pipe read/write**：`pipe_lock` 已在，但阻塞路径要在 `kthread_block_tcb()`
+   之前把 BKL 也放掉（现在只在 `proc_sched()` 前放），并且
+   `uk_pipeidx/uk_piperw/uk_pipeat/uk_pipelen` 的写入顺序要与唤醒方对齐。
+6. **console/tty read/write**：需要先有 tty 锁，`tty_tb.c` 里的环形缓冲目前
+   全靠 BKL。
+7. **`open` / `close`**：最后做。要连带 **namei 的路径级锁**（现在
+   `vfs_namei()` 整条路径不持锁、靠 BKL）与 vnode 生命周期（`vn_put` →
+   `dir_cache_keep` / `vn_free`）。`close` 还要处理 fd 与 pipe/vnode 的
+   引用释放顺序，别在 `fd_lock` 里 `vn_put`（§6.2.9 已经示范了"先放锁再
+   `vn_put`"）。
+
+配套要做的事：
+- **P1 仍未收口**：`smp_user_dispatch` 默认值还是 0。要改成 1，需要一次
+  **3 小时以上**的 8 核混合负载 soak（`soak_p1.sh`：`bash soak_p1.sh 20 30`
+  约 3 小时），确认 TRAP 12 不再出现。现在可用的最强负载是
+  `rdstress`（并发读）+ `proctest`（1000 进程）+ `pthread/pthpre`。
+- **每摘一条路径就扩大一次 `rdstress`**：把新路径也写进
+  `libexec/rdstress.c`（例如加上 lseek/stat 的循环），让并发证据跟着代码走。
+
 
 ### 7.3 P3 — #10 第 ③ 步：缺页离开 BKL（**必须等 7.2 完成**）
 
