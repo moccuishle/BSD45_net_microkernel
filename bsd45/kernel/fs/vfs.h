@@ -117,6 +117,7 @@ int	vfs_aio_selftest(void);
  * a vnode for a lookup result, but must not reach into the pool itself.
  */
 struct vnode *vn_alloc(void);
+void	vn_ref(struct vnode *vp);
 
 /*
  * Backends (S100.2a: tmpfs lives in tmpfs.c behind these, so vfs.c stays a

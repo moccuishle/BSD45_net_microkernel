@@ -430,6 +430,34 @@ triple fault，而不是锁本身。
   已删除的 subsys personality 与 16 级 IPL monitor 命令（README「已删除 /
   未实现的模块」已注明），不是回归；其余 25 套 PASS。
 
+### 6.2.6 P2 第一步：VFS vnode 池 + pipe 表加锁（2026-11-26）
+
+只加锁，**没有摘 BKL**；系统调用入口仍整体持 BKL，所以这些锁目前是"为后续拆分
+准备"，不是并发正确性的唯一依赖。
+
+- **`vfs_lock`（`kernel/fs/vfs.c`）**：保护 vnode 池的空闲扫描/分配、`ref`、
+  `v_id` 发号、目录保留环。`vn_free()`/`dir_cache_keep()` 改成 `_locked`
+  内部版本，调用者必须已持锁。新增 `vn_ref()`，并把 `fd_ref`、fork 继承 fd、
+  name-cache 命中、mmap、aio 里直接 `vp->ref++` 的地方全部改为 `vn_ref()`。
+  `vfs_stats()` 只在统计 `vnode_used[]` 时持锁。
+- **锁边界**：`vfs_namei()`、各后端 `lookup/read/write` 仍不持 `vfs_lock`——
+  它们会走 ATAPI 阻塞 I/O，不能拿自旋锁。因此 namei 的"查 cache + 加引用"
+  仍依赖 BKL，后续要单独做 name-cache 锁与 vnode 引用的一体化。
+- **`pipe_lock`（`kernel/sys/usermode.c`）**：一把锁覆盖 8 个 pipe 槽、读写端
+  计数、环形位置和阻塞 pid。`pipe_alloc()`/`pipe_addref()`/fd_close/fork/
+  fcntl/dup/dup2/pipe() 都走锁；`pipe_wake_reader/writer` 改为 `_locked`
+  版本，调用者持锁。
+- **阻塞规则**：read/write 在 `pipe_lock` 内标记 `uk_regs`、`pp->rpid/wpid`
+  并 `kthread_block_tcb()`（只入队，不切换），**先 `spin_unlock` 再
+  `proc_sched()`**。锁序 `pipe_lock -> sc_rqlock`，没有反向路径。
+- **未做**：pagecache/buffer-cache 自己的锁、name-cache 表锁、fd 表锁、
+  VFS 路径级锁；BKL 入口未动。P2 剩余工作仍是这些。
+
+**验证（2026-11-26）**：全套 25 PASS（`test_subsys`/`test_ipl` 仍为已失效项）；
+`test_s3/s7/tools/cache/mmap/mount` 单独 PASS；8 核基线 pthread/pthmain/pthpre/
+aiotest 全过，0 TRAP；阻塞管道 `cat /readme.txt | head -5` 通过；`proctest`
+到 phase B（1002 live）0 异常，`cpu_reset` 日志只有启动/AP 初始化的实模式 reset。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -512,6 +540,8 @@ triple fault，而不是锁本身。
 
 > 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
 > BKL**，反过来必炸。第 ③ 步（7.3）排在它之后。
+> **进度（2026-11-26）**：VFS vnode 池与 pipe 表已加锁（§6.2.6）；pagecache /
+> buffer cache / name cache / fd 表仍未加锁，BKL 未动。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近

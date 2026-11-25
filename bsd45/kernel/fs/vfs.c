@@ -10,6 +10,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/smp.h>
 
 #include "atapi.h"
 #include "isofs.h"
@@ -33,6 +34,14 @@ struct vnode *rootvnode = &iso_rootv;
 
 /* EN: Which filesystem backs "/".  glue.c sets this before vfs_init() based on whether we booted from the ISO or the installed disk. */
 static int vfs_root_src = VFS_ROOT_ISO;
+
+/*
+ * P2: vnode pool lock.  It covers slot allocation, refcounts, v_id and the
+ * directory-retention ring.  Backend lookups/reads still run under the BKL:
+ * they may block on ATAPI, so they must never be called with this spinlock
+ * held.  Lock order: vfs_lock -> page_lock (vn_free -> pagecache_purge_vp).
+ */
+static struct spinlock vfs_lock;
 
 /* 中文：设置作为根文件系统来源的后端（ISO/tmpfs/FFS），由 glue.c 在 vfs_init() 前调用 */
 /* EN: Set which filesystem backend backs the root (ISO/tmpfs/FFS), called by glue.c before vfs_init() */
@@ -73,7 +82,7 @@ static struct vnode *dir_cache[NDCACHE];
 static int vnode_dcached[VNODES];
 static int dir_cache_next;
 
-static void vn_free(struct vnode *vp);
+static void vn_free_locked(struct vnode *vp);
 
 /*
  * S17: caches key on v_id, never on the vnode pointer, because slots are
@@ -85,8 +94,25 @@ static void vn_free(struct vnode *vp);
 unsigned
 vn_newid(void)
 {
+	unsigned id;
 
-	return (vn_next_id++);
+	spin_lock(&vfs_lock);
+	id = vn_next_id++;
+	spin_unlock(&vfs_lock);
+	return (id);
+}
+
+/* EN: Increment a vnode's reference count under the pool lock. */
+/* 中文：在 vnode 池锁保护下递增引用计数。 */
+void
+vn_ref(struct vnode *vp)
+{
+
+	if (vp == 0)
+		return;
+	spin_lock(&vfs_lock);
+	vp->ref++;
+	spin_unlock(&vfs_lock);
 }
 
 /* EN: Boot reset: rebuilds the vnode_free[] LIFO with indices VNODES-1..0, clears vnode_used[]/vnode_dcached[], zeroes dir_cache[] and resets dir_cache_next. */
@@ -115,7 +141,7 @@ vn_init(void)
 /* EN: Frees a slot: ignores NULL, iso_rootv, the tmpfs root and bad indices, purges name and page cache entries, clears ref/v_id/v_key and vnode_used/vnode_dcached. */
 /* 中文：把 vnode 槽归还池中：忽略 NULL、iso_rootv、tmpfs 根以及越界下标，然后清除其名字缓存与页缓存项，将 ref/v_id/v_key 与 vnode_used/vnode_dcached 清零。 */
 static void
-vn_free(struct vnode *vp)
+vn_free_locked(struct vnode *vp)
 {
 	int i;
 
@@ -141,7 +167,7 @@ vn_free(struct vnode *vp)
 /* EN: Keeps an unreferenced dir vnode in the NDCACHE ring so its name cache stays valid: takes a free slot, else vn_free()s the oldest unreferenced entry, else vn_free()s vp itself. */
 /* 中文：把未引用的目录 vnode 保留在 NDCACHE 环中以免其名字缓存项失效：有空槽则占空槽，否则淘汰最旧的未引用项并用 vn_free() 释放它；若全部被引用则直接 vn_free() vp。 */
 static void
-dir_cache_keep(struct vnode *vp)
+dir_cache_keep_locked(struct vnode *vp)
 {
 	int i = vp - vnode_pool;
 	int k, j;
@@ -167,12 +193,12 @@ dir_cache_keep(struct vnode *vp)
 			dir_cache[j] = vp;
 			vnode_dcached[i] = 1;
 			dir_cache_next = (j + 1) % NDCACHE;
-			vn_free(old);
+			vn_free_locked(old);
 			return;
 		}
 	}
 	/* every retained directory is in use: do not keep this one */
-	vn_free(vp);
+	vn_free_locked(vp);
 }
 
 /* EN: Finds the first unused slot, marks it used, bumps vn_alloc_total, zeroes the vnode, sets ref=1, node=-1 and a fresh v_id via vn_newid(); 0 when the pool is full. */
@@ -180,8 +206,10 @@ dir_cache_keep(struct vnode *vp)
 struct vnode *
 vn_alloc(void)
 {
+	struct vnode *vp = 0;
 	int i;
 
+	spin_lock(&vfs_lock);
 	for (i = 0; i < VNODES; i++) {
 		if (vnode_used[i])
 			continue;
@@ -190,10 +218,12 @@ vn_alloc(void)
 		bzero(&vnode_pool[i], sizeof(vnode_pool[i]));
 		vnode_pool[i].ref = 1;
 		vnode_pool[i].node = -1;
-		vnode_pool[i].v_id = vn_newid();
-		return (&vnode_pool[i]);
+		vnode_pool[i].v_id = vn_next_id++;
+		vp = &vnode_pool[i];
+		break;
 	}
-	return (0);
+	spin_unlock(&vfs_lock);
+	return (vp);
 }
 
 /* EN: Drops a reference (ignoring NULL, iso_rootv, tmpfs root); at ref 0 it clears ref and sends VDIR with nonzero v_key (ISO9660 dirs) to dir_cache_keep(), others to vn_free(). */
@@ -204,6 +234,7 @@ vn_put(struct vnode *vp)
 
 	if (vp == 0 || vp == &iso_rootv || tmpfs_is_root(vp) || ffs_is_root(vp) || jlfs_is_root(vp))
 		return;
+	spin_lock(&vfs_lock);
 	if (--vp->ref <= 0) {
 		vp->ref = 0;
 		/*
@@ -215,10 +246,11 @@ vn_put(struct vnode *vp)
 		 * their data keyed by LBA for ISO9660).
 		 */
 		if (vp->type == VDIR && vp->v_key != 0)
-			dir_cache_keep(vp);
+			dir_cache_keep_locked(vp);
 		else
-			vn_free(vp);
+			vn_free_locked(vp);
 	}
+	spin_unlock(&vfs_lock);
 }
 
 /* EN: Counts used slots by summing vnode_used[], reports VNODES as *vtotal, that sum as *vused and the remainder as *vfree, then lets vfs_page_stats() fill *pnalloc/*pnfree/*pninuse. */
@@ -230,8 +262,10 @@ vfs_stats(unsigned *vtotal, unsigned *vused, unsigned *vfree,
 
 	int i, used = 0;
 
+	spin_lock(&vfs_lock);
 	for (i = 0; i < VNODES; i++)
 		used += vnode_used[i];
+	spin_unlock(&vfs_lock);
 	*vtotal = VNODES;
 	*vused = used;
 	*vfree = VNODES - used;
@@ -462,6 +496,7 @@ vfs_init(void)
 	if (vfs_inited)
 		return;
 	vfs_inited = 1;
+	spin_init(&vfs_lock);
 	vn_init();
 	/*
 	 * S17: bring up the three caches before the first namei().  The pages

@@ -1762,7 +1762,7 @@ do_mmap(unsigned addr, unsigned len, int prot, int flags, int fd)
 		if (share == MAP_SHARED && vp->ops->write == 0 && prot &
 		    PROT_WRITE)
 			return (-EROFS);
-		vp->ref++;
+		vn_ref(vp);
 		vid = pagecache_key(vp);
 	}
 	if (flags & MAP_FIXED) {
@@ -2105,7 +2105,7 @@ aio_submit_sys(int fd, int op, unsigned ubuf, unsigned len, unsigned off)
 	s->a_ki.ki_len = len;
 	s->a_ki.ki_complete = aio_complete_kiocb;
 	s->a_ki.ki_private = s;
-	vp->ref++;
+	vn_ref(vp);
 	r = (op == KI_READ) ? vfs_read_async(&s->a_ki) :
 	    vfs_write_async(&s->a_ki);
 	if (r != EIOCBQUEUED) {
@@ -2978,21 +2978,50 @@ struct pipe {
 
 static struct pipe pipes[NPIPE];
 
+/*
+ * P2: one lock for the eight-slot pipe table.  It covers slot allocation,
+ * reader/writer counts, the ring positions and the blocked pid fields.
+ * Rule: never call proc_sched()/block while holding it; mark the blocker,
+ * drop the lock, then schedule.  Lock order: pipe_lock -> sc_rqlock (via
+ * proc_wake/sched_runnable).  No path takes sc_rqlock and then pipe_lock.
+ */
+static struct spinlock pipe_lock;
+
 /* 中文：分配一个空闲管道槽位并清零，返回管道指针，无空闲则返回 0 */
 /* EN: Allocate and clear a free pipe slot, returning its pointer or 0 if none */
 static struct pipe *
 pipe_alloc(void)
 {
+	struct pipe *pp = 0;
 	int i;
 
+	spin_lock(&pipe_lock);
 	for (i = 0; i < NPIPE; i++) {
 		if (!pipes[i].used) {
 			bzero(&pipes[i], sizeof(pipes[i]));
 			pipes[i].used = 1;
-			return (&pipes[i]);
+			pp = &pipes[i];
+			break;
 		}
 	}
-	return (0);
+	spin_unlock(&pipe_lock);
+	return (pp);
+}
+
+/* EN: Add one reader/writer reference to a pipe under pipe_lock. */
+/* 中文：在 pipe_lock 保护下给管道增加一个读端/写端引用。 */
+static void
+pipe_addref(struct pipe *pp, int rw)
+{
+
+	if (pp == 0)
+		return;
+	spin_lock(&pipe_lock);
+	if (rw == 1)
+		pp->readers++;
+	else if (rw == 2)
+		pp->writers++;
+	spin_unlock(&pipe_lock);
 }
 
 /* 中文：在指定进程页目录下在内核缓冲与用户地址 va 之间拷贝 n 字节，临时切换 CR3 后恢复 */
@@ -3265,7 +3294,7 @@ registered:
 /* 中文：把管道中待读数据交给阻塞的读者：在读者页目录上下文把数据拷入其缓冲，处理环形回绕，置结果并唤醒；eof 时返回 0 */
 /* EN: Hand pending pipe data to a blocked reader: copy into its buffer under its page directory handling ring wrap, set result and wake; EOF yields 0 */
 static void
-pipe_wake_reader(struct pipe *pp, int eof)
+pipe_wake_reader_locked(struct pipe *pp, int eof)
 {
 	struct process *p;
 	unsigned n, first;
@@ -3299,7 +3328,7 @@ pipe_wake_reader(struct pipe *pp, int eof)
 /* 中文：把管道数据在写者上下文拷入阻塞读者缓冲，处理环形回绕并置结果唤醒；epipe 时返回 -EPIPE */
 /* EN: Copy pipe data into a blocked writer's buffer in the writer's context handling ring wrap, set result and wake; epipe yields -EPIPE */
 static void
-pipe_wake_writer(struct pipe *pp, int epipe)
+pipe_wake_writer_locked(struct pipe *pp, int epipe)
 {
 	struct process *p;
 	unsigned space, n, first;
@@ -3345,19 +3374,21 @@ fd_close(int fd)
 	if (fp->type == FD_PIPE && fp->pipeidx >= 0 &&
 	    fp->pipeidx < NPIPE) {
 		pp = &pipes[fp->pipeidx];
+		spin_lock(&pipe_lock);
 		if (fp->rw == 1)
 			pp->readers--;
 		else if (fp->rw == 2)
 			pp->writers--;
 		if (pp->readers <= 0)
-			pipe_wake_writer(pp, 1);
+			pipe_wake_writer_locked(pp, 1);
 		if (pp->writers <= 0)
-			pipe_wake_reader(pp, 1);
+			pipe_wake_reader_locked(pp, 1);
 		if (pp->readers <= 0 && pp->writers <= 0 &&
 		    pp->wpid == 0 && pp->rpid == 0) {
 			pp->used = 0;
 			fp->pipeidx = -1;
 		}
+		spin_unlock(&pipe_lock);
 	}
 	if (fp->vp != 0) {
 		vn_put(fp->vp);
@@ -3373,7 +3404,7 @@ fd_ref(struct kfd *fp)
 {
 
 	if (fp->vp != 0)
-		fp->vp->ref++;
+		vn_ref(fp->vp);
 }
 
 /* --------------------------------------------------------------- process */
@@ -3692,6 +3723,7 @@ proc_table_init(void)
 	user_layout_init();
 	spin_init(&proc_table_lock);
 	spin_init(&page_lock);
+	spin_init(&pipe_lock);
 	procs = (struct process *)kern_table_alloc((unsigned)PROC_TABLE_VA,
 	    (unsigned)NPROC * (unsigned)sizeof(struct process));
 	printf("usermode: %d proc slots at %x (%d KB)\n", NPROC,
@@ -4664,15 +4696,12 @@ do_fork(struct sysregs *r)
 
 		for (i = 0; i < NFD; i++)
 			if (p->uk_fds[i].used && p->uk_fds[i].vp != 0)
-				p->uk_fds[i].vp->ref++;
+				vn_ref(p->uk_fds[i].vp);
 		for (i = 0; i < NFD; i++)
 			if (p->uk_fds[i].used && p->uk_fds[i].type == FD_PIPE &&
-			    p->uk_fds[i].pipeidx >= 0) {
-				if (p->uk_fds[i].rw == 1)
-					pipes[p->uk_fds[i].pipeidx].readers++;
-				else if (p->uk_fds[i].rw == 2)
-					pipes[p->uk_fds[i].pipeidx].writers++;
-			}
+			    p->uk_fds[i].pipeidx >= 0)
+				pipe_addref(&pipes[p->uk_fds[i].pipeidx],
+				    p->uk_fds[i].rw);
 	}
 	p->uk_regs = *r;
 	p->uk_regs.eax = 0;		/* the child returns 0 from fork() */
@@ -6127,11 +6156,14 @@ bsd45_syscall(struct sysregs *r)
 			struct pipe *pp = &pipes[cur->uk_fds[fd].pipeidx];
 			unsigned space, n, first;
 
+			spin_lock(&pipe_lock);
 			if (cur->uk_fds[fd].rw != 2) {
+				spin_unlock(&pipe_lock);
 				r->eax = (unsigned)-EBADF;
 				break;
 			}
 			if (pp->readers <= 0) {
+				spin_unlock(&pipe_lock);
 				r->eax = (unsigned)-EPIPE;
 				break;
 			}
@@ -6144,6 +6176,7 @@ bsd45_syscall(struct sysregs *r)
 				cur->uk_pipeat = buf;
 				cur->uk_pipelen = len;
 				pp->wpid = cur->uk_pid;
+				spin_unlock(&pipe_lock);
 				proc_sched();
 				break;		/* resumed by the reader */
 			}
@@ -6158,7 +6191,8 @@ bsd45_syscall(struct sysregs *r)
 				bcopy((char *)buf + first, pp->buf, n - first);
 			pp->wpos = (pp->wpos + n) % PIPESZ;
 			pp->count += n;
-			pipe_wake_reader(pp, 0);
+			pipe_wake_reader_locked(pp, 0);
+			spin_unlock(&pipe_lock);
 			r->eax = n;
 			break;
 		}
@@ -6353,12 +6387,15 @@ bsd45_syscall(struct sysregs *r)
 			struct pipe *pp = &pipes[cur->uk_fds[fd].pipeidx];
 			unsigned n, first;
 
+			spin_lock(&pipe_lock);
 			if (cur->uk_fds[fd].rw != 1) {
+				spin_unlock(&pipe_lock);
 				r->eax = (unsigned)-EBADF;
 				break;
 			}
 			if (pp->count == 0) {
 				if (pp->writers <= 0) {		/* EOF */
+					spin_unlock(&pipe_lock);
 					r->eax = 0;
 					break;
 				}
@@ -6369,6 +6406,7 @@ bsd45_syscall(struct sysregs *r)
 				cur->uk_pipeat = buf;
 				cur->uk_pipelen = len;
 				pp->rpid = cur->uk_pid;
+				spin_unlock(&pipe_lock);
 				proc_sched();
 				break;		/* resumed by the writer */
 			}
@@ -6383,7 +6421,8 @@ bsd45_syscall(struct sysregs *r)
 				bcopy(pp->buf, (char *)buf + first, n - first);
 			pp->rpos = (pp->rpos + n) % PIPESZ;
 			pp->count -= n;
-			pipe_wake_writer(pp, 0);
+			pipe_wake_writer_locked(pp, 0);
+			spin_unlock(&pipe_lock);
 			r->eax = n;
 			break;
 		}
@@ -7048,12 +7087,9 @@ bsd45_syscall(struct sysregs *r)
 			cur->uk_fds[newfd] = cur->uk_fds[fd];
 			fd_ref(&cur->uk_fds[newfd]);
 			if (cur->uk_fds[newfd].type == FD_PIPE &&
-			    cur->uk_fds[newfd].pipeidx >= 0) {
-				if (cur->uk_fds[newfd].rw == 1)
-					pipes[cur->uk_fds[newfd].pipeidx].readers++;
-				else
-					pipes[cur->uk_fds[newfd].pipeidx].writers++;
-			}
+			    cur->uk_fds[newfd].pipeidx >= 0)
+				pipe_addref(&pipes[cur->uk_fds[newfd].pipeidx],
+				    cur->uk_fds[newfd].rw);
 			r->eax = newfd;
 			break;
 		}
@@ -7080,12 +7116,9 @@ bsd45_syscall(struct sysregs *r)
 		}
 		cur->uk_fds[to] = cur->uk_fds[from];
 		fd_ref(&cur->uk_fds[to]);
-		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0) {
-			if (cur->uk_fds[to].rw == 1)
-				pipes[cur->uk_fds[to].pipeidx].readers++;
-			else
-				pipes[cur->uk_fds[to].pipeidx].writers++;
-		}
+		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0)
+			pipe_addref(&pipes[cur->uk_fds[to].pipeidx],
+			    cur->uk_fds[to].rw);
 		r->eax = to;
 		break;
 	}
@@ -7103,8 +7136,10 @@ bsd45_syscall(struct sysregs *r)
 			r->eax = (unsigned)-EMFILE;
 			break;
 		}
+		spin_lock(&pipe_lock);
 		pp->readers = 1;
 		pp->writers = 1;
+		spin_unlock(&pipe_lock);
 		for (i = 3; i < NFD && nfd < 2; i++) {
 			if (!cur->uk_fds[i].used) {
 				fds[nfd++] = i;
@@ -7122,7 +7157,9 @@ bsd45_syscall(struct sysregs *r)
 			}
 		}
 		if (nfd < 2) {
+			spin_lock(&pipe_lock);
 			pp->used = 0;
+			spin_unlock(&pipe_lock);
 			r->eax = (unsigned)-EMFILE;
 			break;
 		}
@@ -7146,12 +7183,9 @@ bsd45_syscall(struct sysregs *r)
 		fd_close(to);
 		cur->uk_fds[to] = cur->uk_fds[from];
 		fd_ref(&cur->uk_fds[to]);
-		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0) {
-			if (cur->uk_fds[to].rw == 1)
-				pipes[cur->uk_fds[to].pipeidx].readers++;
-			else
-				pipes[cur->uk_fds[to].pipeidx].writers++;
-		}
+		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0)
+			pipe_addref(&pipes[cur->uk_fds[to].pipeidx],
+			    cur->uk_fds[to].rw);
 		r->eax = to;
 		break;
 	}

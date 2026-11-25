@@ -210,7 +210,7 @@ namecache_lookup(struct vnode *dv, const char *name)
 	nc_hits++;
 	nc_lru_remove(i);
 	nc_lru_append(i);
-	vp->ref++;
+	vn_ref(vp);
 	return (vp);
 }
 
