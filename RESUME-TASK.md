@@ -411,6 +411,25 @@ triple fault，而不是锁本身。
   `BSD45_microkernel` 的重复配置，指向同一仓库。）上表是 S432 首次同步时的
   提交号，之后每次文档/工具提交仍按同样方式用 `commit-tree` 推进 4 个镜像。
 
+### 6.2.5 Windows/PowerShell 构建修复与 2026-11-26 基线
+
+- **ld 参数过多会静默崩溃**：`/bin/sh` 链接 140 个 `.o` 时，`ld -m i386pe ... @objs`
+  在 Windows 上以 `0xC0000409` 退出且不打印任何诊断。改为把对象列表写进
+  `@response.rsp`（路径必须用 `/`，反斜杠会被 ld 当转义）后正常。
+  `tools-find.ps1` 新增 `Invoke-LdRsp`，`build_sh.ps1`（sh 与每个工具）和
+  `build_kernel.ps1`（两遍链接）统一走它。
+- **PowerShell 工具清单漏 `pthmain`**：`build_sh.sh` 与 `build_iso.ps1` 都列了，
+  `build_sh.ps1` 没有，导致 ISO 里没有 `/bin/PTHMAIN.ELF`；已补。
+- **半成品 `build/incu` 会让头文件准备提前返回**：`Prepare-Headers` 只要看到
+  `errno.h` 就 return。一次中断的构建会留下“有 `errno.h`、`sys/` 为空”的目录，
+  之后每次都在 `sys/param.h` 上失败。重建前先删掉或移走 `build/incu`。
+- **8 核基线（HEAD `d2292c6` + 本次构建修复）**：`smpon`/`smpuser`/`shell`、
+  `pthread`/`pthmain`/`pthpre`/`aiotest`、`ps` 全过；日志中 0 个 `TRAP`、
+  triple fault、`STACK OVERFLOW`、`address space busy`。
+- **全套验收 25 PASS / 2 失效**：`test_subsys` 与 `test_ipl` 依赖 `36a84a1`
+  已删除的 subsys personality 与 16 级 IPL monitor 命令（README「已删除 /
+  未实现的模块」已注明），不是回归；其余 25 套 PASS。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -459,7 +478,8 @@ triple fault，而不是锁本身。
    ```
    判据：`pthread` / `pthmain` / `pthpre` / `aiotest` 全 PASS；TRAP、triple
    fault、`STACK OVERFLOW`、`address space busy` 全 0。
-3. 任何内核改动后都要跑全套验收 `tools/all_tests.sh`（15 套）。
+3. 任何内核改动后都要跑全套验收 `tools/all_tests.sh`（当前 26 套；其中
+   `test_subsys` / `test_ipl` 因 `36a84a1` 删除 subsys/IPL 已失效，见 §6.2.5）。
 4. 抓 triple fault 用 `--qemu-extra=-d --qemu-extra=cpu_reset --qemu-extra=-D
    --qemu-extra=diag_cpu.log`；**以 `-` 开头的值必须写成等号形式**，
    `--qemu-extra -d` 会被 argparse 当成新选项直接退出。

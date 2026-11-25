@@ -348,8 +348,10 @@ $ldflags = @(
 )
 
 # pass 1: discover section layout with a harmless _end
-& $LD @ldflags "--defsym", "_end=0xFE180000", "--defsym", "_edata=0xFE140000", "--defsym", "_etext=0xFE140000" -o "$bld\kernel.pe" @objs 2>&1 | Select-Object -First 40
-if ($LASTEXITCODE -ne 0) { Write-Host "link pass1 failed" -ForegroundColor Red; exit 1 }
+$rc = Invoke-LdRsp -Ld $LD -LdFlags $ldflags -Out "$bld\kernel.pe" -Objects $objs `
+    -Tail @("--defsym", "_end=0xFE180000", "--defsym", "_edata=0xFE140000", "--defsym", "_etext=0xFE140000") `
+    -RspPath "$bld\link_kernel.rsp"
+if ($rc -ne 0) { Write-Host "link pass1 failed" -ForegroundColor Red; exit 1 }
 
 $sect = & $OD -h "$bld\kernel.pe" 2>&1
 $maxEnd = [long]0
@@ -373,8 +375,10 @@ Write-Host ("sections end {0:x}, _end {1:x}, _edata {2:x}, _etext {3:x}" -f $max
 $endSym  = "_end=0x{0:x}"   -f $endAddr
 $dataSym = "_edata=0x{0:x}" -f $dataEnd
 $textSym = "_etext=0x{0:x}" -f $textEnd
-& $LD @ldflags "--defsym", $endSym, "--defsym", $dataSym, "--defsym", $textSym -o "$bld\kernel.pe" @objs 2>&1 | Select-Object -First 40
-if ($LASTEXITCODE -ne 0) { Write-Host "link pass2 failed" -ForegroundColor Red; exit 1 }
+$rc = Invoke-LdRsp -Ld $LD -LdFlags $ldflags -Out "$bld\kernel.pe" -Objects $objs `
+    -Tail @("--defsym", $endSym, "--defsym", $dataSym, "--defsym", $textSym) `
+    -RspPath "$bld\link_kernel.rsp"
+if ($rc -ne 0) { Write-Host "link pass2 failed" -ForegroundColor Red; exit 1 }
 
 & $OC -O elf32-i386 -R .idata -R .reloc "$bld\kernel.pe" "$bld\bsd45.elf"
 if ($LASTEXITCODE -ne 0) { Write-Host "objcopy failed" -ForegroundColor Red; exit 1 }

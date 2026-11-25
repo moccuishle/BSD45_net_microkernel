@@ -77,6 +77,29 @@ function Get-GccInclude([string]$bin) {
     throw "cannot locate the GCC include directory under $bin"
 }
 
+# Link a PE image through an ld response file.  Passing 100+ object files on
+# the Windows command line makes binutils 2.47 ld die with 0xC0000409 before
+# printing anything (seen when linking /bin/sh, 140 objects).  An @file with
+# forward slashes is the portable fix; backslashes would be eaten as escapes.
+function Invoke-LdRsp {
+    param(
+        [string]$Ld,
+        [string[]]$LdFlags,
+        [string]$Out,
+        [string[]]$Objects,
+        [string[]]$Tail = @(),
+        [string]$RspPath
+    )
+    if (!$RspPath) {
+        $RspPath = Join-Path ([IO.Path]::GetTempPath()) ("bsd45-ld-" + [guid]::NewGuid().ToString("N") + ".rsp")
+    }
+    ($Objects | ForEach-Object { $_ -replace '\\', '/' }) | Set-Content -Encoding ASCII $RspPath
+    $log = & $Ld @LdFlags -o $Out "@$RspPath" @Tail 2>&1
+    $code = $LASTEXITCODE
+    $log | Select-Object -First 40 | ForEach-Object { Write-Host $_ }
+    return $code
+}
+
 function Get-Mkisofs {
     $cands = @()
     if ($env:MKISOFS) { $cands += $env:MKISOFS }

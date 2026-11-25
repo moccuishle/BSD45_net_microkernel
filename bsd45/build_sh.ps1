@@ -316,20 +316,21 @@ if (Test-Path $quad) { $libgcc += $quad }
 if (Test-Path $chk)  { $libgcc += $chk }
 $hostlibgcc = (& $GCC -print-libgcc-file-name).Trim()
 if (!$libgcc.Count -and $hostlibgcc -and (Test-Path $hostlibgcc)) { $libgcc = @($hostlibgcc) }
-& $LD -m i386pe -Ttext 0x08048000 -e _start --subsystem console -o $pe @objs $libgcc 2>&1 | Select-Object -First 30
-if ($LASTEXITCODE -ne 0) { Write-Host "link failed" -ForegroundColor Red; exit 1 }
+$ldflags = @("-m", "i386pe", "-Ttext", "0x08048000", "-e", "_start", "--subsystem", "console")
+$rc = Invoke-LdRsp -Ld $LD -LdFlags $ldflags -Out $pe -Objects $objs -Tail $libgcc -RspPath "$bld\link_sh.rsp"
+if ($rc -ne 0) { Write-Host "link failed" -ForegroundColor Red; exit 1 }
 & $OC -O elf32-i386 -R .idata -R .reloc $pe $elf
 if ($LASTEXITCODE -ne 0) { Write-Host "objcopy failed" -ForegroundColor Red; exit 1 }
 Write-Host ("built {0} ({1:N0} bytes)" -f $elf, (Get-Item $elf).Length)
 
 if ($Target -eq "sh") {
     # /bin/echo, /bin/ls: small tools linked against the same libc.
-    foreach ($tool in @("echo", "ls", "cat", "mkdir", "kill", "sleep", "rm", "cp", "mv", "wc", "grep", "head", "tail", "df", "mount", "ps", "uname", "true", "false", "date", "vmstat", "mmaptest", "subtest", "pthread", "schedtest", "pthpreempt", "aiotest", "uring", "spin", "cowtest", "crash", "badptr", "ipctest", "fs_server", "srvtest", "devfs_server", "devtest", "shmtest", "vfstest", "proctest", "netsrv", "nettest")) {
+    foreach ($tool in @("echo", "ls", "cat", "mkdir", "kill", "sleep", "rm", "cp", "mv", "wc", "grep", "head", "tail", "df", "mount", "ps", "uname", "true", "false", "date", "vmstat", "mmaptest", "subtest", "pthread", "schedtest", "pthpreempt", "pthmain", "aiotest", "uring", "spin", "cowtest", "crash", "badptr", "ipctest", "fs_server", "srvtest", "devfs_server", "devtest", "shmtest", "vfstest", "proctest", "netsrv", "nettest")) {
         $tobj = "$obj\$tool.o"
         if (Compile-C (Join-Path $ws "libexec\$tool.c") $tobj) {
             $tobjs = @($libobjs) + @($tobj)
-            & $LD -m i386pe -Ttext 0x08048000 -e _start --subsystem console -o "$bld\$tool.pe" @tobjs $libgcc 2>&1 | Select-Object -First 20
-            if ($LASTEXITCODE -eq 0) {
+            $rc = Invoke-LdRsp -Ld $LD -LdFlags $ldflags -Out "$bld\$tool.pe" -Objects $tobjs -Tail $libgcc -RspPath "$bld\link_$tool.rsp"
+            if ($rc -eq 0) {
                 & $OC -O elf32-i386 -R .idata -R .reloc "$bld\$tool.pe" "$outd\$tool.elf"
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host ("built {0} ({1:N0} bytes)" -f "$outd\$tool.elf", (Get-Item "$outd\$tool.elf").Length)
