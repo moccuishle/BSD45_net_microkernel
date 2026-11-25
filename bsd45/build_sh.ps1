@@ -325,7 +325,7 @@ Write-Host ("built {0} ({1:N0} bytes)" -f $elf, (Get-Item $elf).Length)
 
 if ($Target -eq "sh") {
     # /bin/echo, /bin/ls: small tools linked against the same libc.
-    foreach ($tool in @("echo", "ls", "cat", "mkdir", "kill", "sleep", "rm", "cp", "mv", "wc", "grep", "head", "tail", "df", "mount", "ps", "uname", "true", "false", "date", "vmstat", "mmaptest", "subtest", "pthread", "schedtest", "pthpreempt", "pthmain", "aiotest", "uring", "spin", "cowtest", "crash", "badptr", "ipctest", "fs_server", "srvtest", "devfs_server", "devtest", "shmtest", "vfstest", "proctest", "netsrv", "nettest")) {
+    foreach ($tool in @("echo", "ls", "cat", "mkdir", "kill", "sleep", "rm", "cp", "mv", "wc", "grep", "head", "tail", "df", "mount", "ps", "uname", "true", "false", "date", "vmstat", "mmaptest", "subtest", "pthread", "schedtest", "pthpreempt", "pthmain", "aiotest", "rdstress", "uring", "spin", "cowtest", "crash", "badptr", "ipctest", "fs_server", "srvtest", "devfs_server", "devtest", "shmtest", "vfstest", "proctest", "netsrv", "nettest")) {
         $tobj = "$obj\$tool.o"
         if (Compile-C (Join-Path $ws "libexec\$tool.c") $tobj) {
             $tobjs = @($libobjs) + @($tobj)

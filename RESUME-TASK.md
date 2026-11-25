@@ -531,6 +531,35 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 遍历是本次改动的主路径）；8 核基线 `pthread`/`pthmain`/`pthpre`/`aiotest`
 全过、0 TRAP。
 
+### 6.2.9 P2 第四步：fd 表锁 + 第一条摘 BKL 的系统调用路径（2026-11-26）
+
+这里是 §7.2 说的"一条路径试摘 BKL"，选的是**普通文件 `read(2)`**。
+
+- **`fd_lock`（`kernel/sys/usermode.c`）**：一把全局锁（本移植 16 fd/进程、
+  NPROC 进程，不值得做 per-process）。规则写进注释：只在锁内做 fd 数组的
+  扫描/校验/偏移更新，**绝不跨后端调用**；锁内允许递增 vnode 引用，锁序
+  `fd_lock -> vfs_lock`，反向不存在。
+- **`read` 的文件分支改成三步**：
+  1. 持 `fd_lock`：校验 `vp != 0` 且非目录、快照 `off`、`vn_ref(vp)`，放锁；
+  2. `smp_bkl_drop()` → `vfs_read_sync()` → `smp_bkl_enter()`；
+  3. 持 `fd_lock`：仅当该 fd 仍指向同一 vnode 才提交 `off += n`，放锁后再
+     `vn_put(vp)`（把 vfs 锁从 fd 锁里挪出来，只在取引用时需要嵌套）。
+- **为什么这条路径能摘**：它触及的结构全都已经有自己的锁——页缓存
+  `pc_lock`、vnode 池与名字缓存 `vfs_lock -> nc_lock`、buffer cache
+  `bio_lock`；fd 本身由 `fd_lock` 保护；它不睡眠、不阻塞、不碰进程表。
+- **仍未摘**：`write`、`open`、`close`、`fork`、`exec`、信号、pipe、终端，
+  以及 `read` 的其它 fd 类型（pipe/console/devfs/tmpfile）都还在 BKL 内。
+- **新测试**：`libexec/rdstress.c`（ISO 内 `/bin/rdstress`，打包名
+  `RDSTRESS.ELF`；四个构建清单都已同步）。4 个子进程 × 32 次
+  open/read/close，每次与 1043 字节基准副本逐字节比对——这是这条路径在
+  多核上真正并行的证据。
+
+**验证（2026-11-26）**：全套 25 PASS（同上两套已失效项）；`test_s3`/
+`test_tools`/`test_s7`/`test_cache`/`test_mmap` 单独 PASS；8 核同一次启动内
+`pthread` → `rdstress` → `pthpre` → `aiotest` 全 PASS，0 TRAP；单独跑
+`rdstress` 也是 PASS。
+
+
 
 
 ### 6.3 调度 / 作业控制功能缺口
@@ -616,9 +645,10 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 > 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
 > BKL**，反过来必炸。第 ③ 步（7.3）排在它之后。
 > **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache、
-> name cache 已加锁（§6.2.6-§6.2.8）；只剩 fd 表未加锁，BKL 未动。
-> 下一步：fd 表锁（`kern_descrip.c` / `uk_fds`），然后是第一条只读 syscall
-> 路径的 BKL 试摘。
+> name cache、fd 表都已加锁；**普通文件 `read(2)` 已摘掉 BKL**（§6.2.9），
+> 其余系统调用仍在 BKL 内。
+> 下一步：把 `read` 的其它 fd 类型与 `write` 逐个移出 BKL，然后是 open/close
+> （要连带 namei 的路径级锁）；`smp_user_dispatch` 默认值仍为 0。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近

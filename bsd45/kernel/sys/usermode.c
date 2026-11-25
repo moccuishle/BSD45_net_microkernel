@@ -2987,6 +2987,26 @@ static struct pipe pipes[NPIPE];
  */
 static struct spinlock pipe_lock;
 
+/*
+ * P2/§7.2: file descriptor table lock.
+ *
+ * The fd table lives in struct process (uk_fds[NFD]) and is shared by every
+ * thread of that process, so pthreads can open/close/read the same table on
+ * different CPUs once the BKL stops covering the whole syscall.  One global
+ * lock is enough for this port (16 fds per process, NPROC processes).
+ *
+ * Rules:
+ *   - it is a leaf lock: only fd-array scans, validations and offset
+ *     updates happen inside it, never a backend call;
+ *   - taking a vnode reference inside it is allowed and is the documented
+ *     order fd_lock -> vfs_lock; nothing takes fd_lock while holding
+ *     vfs_lock, pipe_lock or the BKL-internal locks;
+ *   - the read(2) path below is the first user of it, together with the
+ *     first BKL-dropped syscall path.
+ */
+/* 中文：P2 fd 表锁：fd 表在 struct process 内、由同进程所有线程共享；BKL 一旦不再覆盖整条系统调用，pthread 就会在不同核上并发读写它。本移植用一把全局锁。规则：只做 fd 数组扫描/校验/偏移更新，绝不跨后端调用；锁内可递增 vnode 引用，锁序 fd_lock -> vfs_lock，反向不存在。 */
+static struct spinlock fd_lock;
+
 /* 中文：分配一个空闲管道槽位并清零，返回管道指针，无空闲则返回 0 */
 /* EN: Allocate and clear a free pipe slot, returning its pointer or 0 if none */
 static struct pipe *
@@ -3724,6 +3744,7 @@ proc_table_init(void)
 	spin_init(&proc_table_lock);
 	spin_init(&page_lock);
 	spin_init(&pipe_lock);
+	spin_init(&fd_lock);
 	procs = (struct process *)kern_table_alloc((unsigned)PROC_TABLE_VA,
 	    (unsigned)NPROC * (unsigned)sizeof(struct process));
 	printf("usermode: %d proc slots at %x (%d KB)\n", NPROC,
@@ -6348,16 +6369,46 @@ bsd45_syscall(struct sysregs *r)
 			break;
 		}
 		if (cur->uk_fds[fd].vp != 0) {
+			struct vnode *vp2;
+			unsigned off2;
 			int n2;
 
-			if (cur->uk_fds[fd].vp->type == VDIR) {
+			/*
+			 * §7.2 first BKL-free path: read(2) on a regular file.
+			 * Inside fd_lock we validate the descriptor, pin the
+			 * vnode (fd_lock -> vfs_lock) and snapshot the offset;
+			 * the page-cache read then runs with the BKL released.
+			 * Everything it touches is already locked: page cache
+			 * (pc_lock), vnode pool and name cache (vfs_lock ->
+			 * nc_lock).  The offset is committed back only if the
+			 * descriptor still names the same vnode.
+			 */
+			/* 中文：§7.2 第一条摘掉 BKL 的路径：普通文件 read(2)。锁内校验 fd、固定 vnode（fd_lock -> vfs_lock）并取偏移快照，页缓存读在放掉 BKL 后执行；它触及的结构都已加锁（pc_lock、vfs_lock -> nc_lock）。只有在 fd 仍指向同一 vnode 时才回写偏移。 */
+			spin_lock(&fd_lock);
+			vp2 = cur->uk_fds[fd].vp;
+			if (vp2 == 0) {
+				spin_unlock(&fd_lock);
+				r->eax = (unsigned)-EBADF;
+				break;
+			}
+			if (vp2->type == VDIR) {
+				spin_unlock(&fd_lock);
 				r->eax = (unsigned)-EISDIR;
 				break;
 			}
-			n2 = vfs_read_sync(cur->uk_fds[fd].vp,
-			    cur->uk_fds[fd].off, (void *)buf, len);
-			if (n2 > 0)
-				cur->uk_fds[fd].off += n2;
+			off2 = cur->uk_fds[fd].off;
+			vn_ref(vp2);
+			spin_unlock(&fd_lock);
+
+			smp_bkl_drop();
+			n2 = vfs_read_sync(vp2, off2, (void *)buf, len);
+			smp_bkl_enter();
+
+			spin_lock(&fd_lock);
+			if (n2 > 0 && cur->uk_fds[fd].vp == vp2)
+				cur->uk_fds[fd].off = off2 + (unsigned)n2;
+			spin_unlock(&fd_lock);
+			vn_put(vp2);
 			r->eax = (unsigned)n2;
 			break;
 		}

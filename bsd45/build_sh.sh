@@ -357,7 +357,7 @@ if [ "$target" = "sh" ]; then
 	# with the copy list in build_iso.sh/build_iso.ps1.
 	tools=(echo ls cat mkdir kill sleep rm cp mv wc grep head tail df mount
 	       ps uname true false date vmstat mmaptest subtest pthread schedtest
-	       pthpreempt pthmain aiotest uring spin cowtest crash badptr ipctest
+	       pthpreempt pthmain aiotest rdstress uring spin cowtest crash badptr ipctest
 	       fs_server srvtest devfs_server devtest shmtest vfstest proctest
 	       netsrv nettest)
 	for tool in "${tools[@]}"; do
