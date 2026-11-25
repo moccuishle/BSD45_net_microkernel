@@ -495,6 +495,43 @@ aiotest 全过，0 TRAP；阻塞管道 `cat /readme.txt | head -5` 通过；`pro
 但同一次 qdrive 已报 "boot timeout (no monitor prompt)"，且同一序列重跑
 4 次全过，判为 TCG 启动抖动；后续 soak 继续观察。
 
+**Soak（2026-11-26 05:43-06:36，约 53 分钟）**：8 次 8 核 3GB 启动 × 24 循环
+（`ls`/`cat`/`ps`/`uname`/`date`/`pthread` 共 144 条命令/轮），boot3 额外
+`proctest` 到 phase B（1002 live）。**192 循环、0 个 `TRAP`/triple fault/
+`STACK OVERFLOW`/`address space busy`**；8 轮里 7 轮 rc=0，boot3 rc=1 是
+proctest 之后 TCG 回收超时（异常仍为 0）。第二次基线那次 `aiotest` 静止没有
+在 8 轮 soak 中复现。
+
+### 6.2.8 P2 第三步：name cache 表锁（2026-11-26）
+
+这一步的难点不是"加一把锁"，而是**锁序**：`vn_free()` 在持 `vfs_lock` 时
+调用 `namecache_purge_vp()`，而 `namecache_lookup()` 又必须在"表项校验通过"
+与"`vp->ref++`"之间不被回收 vnode 槽——否则就回到 S17 之前那个"复活已释放
+vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`。
+
+- **`nc_lock`（`kernel/fs/vfs_cache.c`）**：保护 64 条 `nc[]`、32 个哈希桶、
+  LRU 与命中/未命中计数；`nc_*` 内部辅助函数改为"调用者持锁"。
+- **关键处理**：`namecache_lookup()` **先取池锁**（新增
+  `vfs_pool_lock()/vfs_pool_unlock()` 导出），再取 `nc_lock`，校验 `v_id`
+  后用新增的 `vn_ref_locked()` 递增引用。`vn_ref()` 改成
+  `spin_lock -> vn_ref_locked -> spin_unlock` 的组合，行为不变但消除重复。
+- **`enter`/`purge`/`purge_vp`/`stats`**：只需 `nc_lock`。它们读的
+  `v_id` 只当提示用，`lookup` 会重新校验，所以不需要池锁（也不会因此多一层
+  嵌套）。
+- **初始化**：`nc_inited` 改为最后置位，与 pc/bio 一致；同样在 `vfs_init()`
+  的单 CPU 阶段调用。
+- **锁序总结（当前全部子系统锁）**：
+  `vfs_lock -> nc_lock`、`vfs_lock -> pc_lock`、`pc_lock -> page_lock`、
+  `bio_lock -> page_lock`；`pc_lock` 与 `bio_lock` 永不嵌套；任何子系统锁都
+  不跨设备访问、不等 BKL。
+- **未做**：fd 表锁；BKL 入口仍未摘。
+
+**验证（2026-11-26）**：全套 25 PASS（同上两套已失效项）；`test_wpath`/
+`test_tools`/`test_s3`/`test_mount`/`test_cache` 单独 PASS（namei 与路径
+遍历是本次改动的主路径）；8 核基线 `pthread`/`pthmain`/`pthpre`/`aiotest`
+全过、0 TRAP。
+
+
 
 ### 6.3 调度 / 作业控制功能缺口
 
@@ -578,10 +615,10 @@ aiotest 全过，0 TRAP；阻塞管道 `cat /readme.txt | head -5` 通过；`pro
 
 > 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
 > BKL**，反过来必炸。第 ③ 步（7.3）排在它之后。
-> **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache 已
-> 加锁（§6.2.6、§6.2.7）；name cache / fd 表仍未加锁，BKL 未动。
-> 下一步按本文"一次一个子系统 + 一条路径"的规则，做 name cache 表锁，然后
-> 才是 fd 表。
+> **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache、
+> name cache 已加锁（§6.2.6-§6.2.8）；只剩 fd 表未加锁，BKL 未动。
+> 下一步：fd 表锁（`kern_descrip.c` / `uk_fds`），然后是第一条只读 syscall
+> 路径的 BKL 试摘。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近

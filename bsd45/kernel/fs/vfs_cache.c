@@ -17,6 +17,7 @@
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/smp.h>
 
 #include "vfs.h"
 
@@ -46,6 +47,18 @@ static int nc_inited;
 
 static unsigned nc_hits, nc_misses;
 
+/*
+ * P2: name-cache table lock.  It covers nc[], the hash buckets, the LRU and
+ * the hit/miss counters, and never spans a backend call.
+ * Lock order: vfs_lock -> nc_lock.  vn_free() purges the name cache from
+ * inside the pool lock, and namecache_lookup() has to bump vp->ref while the
+ * entry it validated is still valid, so it takes the pool lock first and
+ * calls vn_ref_locked().  Entry filling (namecache_enter/purge) only needs
+ * nc_lock: v_id reads there are hints, and lookup revalidates them.
+ */
+/* 中文：P2 名字缓存表锁：保护表项、哈希桶、LRU 与计数，不跨越后端调用。锁序 vfs_lock -> nc_lock：vn_free() 在池锁内清理本缓存，而 lookup 需在表项仍有效时递增引用，故先取池锁再调 vn_ref_locked()；enter/purge 只需 nc_lock，其中的 v_id 读取只作提示，lookup 会重新校验。 */
+static struct spinlock nc_lock;
+
 /* EN: Hashes a directory v_id and entry name into a name-cache bucket: starts at dv_id*31, folds each name byte as h*33+c, and returns the sum modulo NCHASH. */
 /* 中文：把目录 v_id 与名字散列到名字缓存桶：初值为 dv_id*31，逐字节做 h*33+字符 折叠，最后对 NCHASH 取模返回。 */
 static unsigned
@@ -59,6 +72,11 @@ nc_hashfn(unsigned dv_id, const char *name)
 }
 
 /* ---------------------------------------------------------------- LRU */
+
+/*
+ * Every nc_ helper below runs with nc_lock held.
+ */
+/* 中文：下面所有 nc_ 内部辅助函数都在持有 nc_lock 时调用。 */
 
 /* EN: Unlinks entry i from the doubly linked LRU list of live entries, fixing nc_lru_head and nc_lru_tail when it is an end, then sets both its links to -1. */
 /* 中文：把序号 i 的表项从活跃项 LRU 双向链表上摘除，若位于表头或表尾则修正 nc_lru_head/nc_lru_tail，随后把它的两个链接置 -1。 */
@@ -168,7 +186,12 @@ namecache_init(void)
 
 	if (nc_inited)
 		return;
-	nc_inited = 1;
+	/*
+	 * Runs from vfs_init() while the machine is still uniprocessor;
+	 * nc_inited is raised last so a late caller never sees a half-built
+	 * table.
+	 */
+	/* 中文：由 vfs_init() 在单 CPU 阶段调用；nc_inited 最后置位，避免别的 CPU 看到半成品表。 */
 	for (i = 0; i < NCHASH; i++)
 		nc_hash[i] = -1;
 	nc_lru_head = nc_lru_tail = -1;
@@ -178,6 +201,7 @@ namecache_init(void)
 		nc[i].lprev = nc[i].lnext = -1;
 	}
 	nc_hits = nc_misses = 0;
+	nc_inited = 1;
 }
 
 /*
@@ -195,9 +219,20 @@ namecache_lookup(struct vnode *dv, const char *name)
 	if (!nc_inited || dv == 0 || name == 0 || name[0] == 0 ||
 	    strlen(name) >= NC_NAMELEN)
 		return (0);
+	/*
+	 * The pool lock comes first (lock order).  Holding it also keeps the
+	 * slot from being recycled or freed between the v_id check and
+	 * vn_ref_locked(), which is exactly what makes a reference-free cache
+	 * entry safe.
+	 */
+	/* 中文：先取池锁（固定锁序）：它同时保证 v_id 校验与 vn_ref_locked() 之间槽不会被回收或释放，这正是"表项不持引用"仍安全的原因。 */
+	vfs_pool_lock();
+	spin_lock(&nc_lock);
 	i = nc_find(dv->v_id, name);
 	if (i < 0) {
 		nc_misses++;
+		spin_unlock(&nc_lock);
+		vfs_pool_unlock();
 		return (0);
 	}
 	vp = nc[i].vp;
@@ -205,12 +240,16 @@ namecache_lookup(struct vnode *dv, const char *name)
 		/* the cached vnode was recycled: this is a miss */
 		nc_drop(i);
 		nc_misses++;
+		spin_unlock(&nc_lock);
+		vfs_pool_unlock();
 		return (0);
 	}
 	nc_hits++;
 	nc_lru_remove(i);
 	nc_lru_append(i);
-	vn_ref(vp);
+	vn_ref_locked(vp);
+	spin_unlock(&nc_lock);
+	vfs_pool_unlock();
 	return (vp);
 }
 
@@ -226,11 +265,13 @@ namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
 	len = strlen(name);
 	if (len >= NC_NAMELEN)
 		return;
+	spin_lock(&nc_lock);
 	if ((i = nc_find(dv->v_id, name)) >= 0) {
 		nc[i].vp = vp;
 		nc[i].v_id = vp->v_id;
 		nc_lru_remove(i);
 		nc_lru_append(i);
+		spin_unlock(&nc_lock);
 		return;
 	}
 	/* free slot first, then the oldest live entry */
@@ -239,8 +280,10 @@ namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
 			break;
 	if (i == NCACHE) {
 		i = nc_lru_head;
-		if (i < 0)
+		if (i < 0) {
+			spin_unlock(&nc_lock);
 			return;
+		}
 		nc_drop(i);
 	}
 	n = i;
@@ -252,6 +295,7 @@ namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
 	nc[n].name[len] = 0;
 	nc_hash_insert(n);
 	nc_lru_append(n);
+	spin_unlock(&nc_lock);
 }
 
 /* EN: Drops the one cache entry matching directory v_id and name via nc_drop; does nothing when the cache is uninitialized or the name is not cached. */
@@ -263,9 +307,11 @@ namecache_purge(struct vnode *dv, const char *name)
 
 	if (!nc_inited || dv == 0 || name == 0)
 		return;
+	spin_lock(&nc_lock);
 	i = nc_find(dv->v_id, name);
 	if (i >= 0)
 		nc_drop(i);
+	spin_unlock(&nc_lock);
 }
 
 /* EN: Scans all NCACHE slots and drops every entry that points at vp by pointer or matches its v_id, so a recycled vnode leaves no stale name hints. */
@@ -277,24 +323,28 @@ namecache_purge_vp(struct vnode *vp)
 
 	if (!nc_inited || vp == 0)
 		return;
+	spin_lock(&nc_lock);
 	for (i = 0; i < NCACHE; i++)
 		if (nc[i].used && (nc[i].vp == vp ||
 		    (vp->v_id != 0 && nc[i].v_id == vp->v_id)))
 			nc_drop(i);
+	spin_unlock(&nc_lock);
 }
 
-/* EN: Reports NCACHE as total, counts slots with used set, and returns the accumulated nc_hits and nc_misses counters; no locking is performed. */
-/* 中文：返回总数 NCACHE、统计 used 置位的已用槽数，并给出累计的 nc_hits 与 nc_misses 计数；过程中不加锁。 */
+/* EN: Reports NCACHE as total, counts slots with used set, and returns the accumulated nc_hits and nc_misses counters under nc_lock. */
+/* 中文：在 nc_lock 保护下返回总数 NCACHE、统计 used 置位的已用槽数，并给出累计的 nc_hits 与 nc_misses 计数。 */
 void
 namecache_stats(unsigned *total, unsigned *used, unsigned *hits,
     unsigned *misses)
 {
 	int i, nused = 0;
 
+	spin_lock(&nc_lock);
 	for (i = 0; i < NCACHE; i++)
 		nused += nc[i].used;
 	*total = NCACHE;
 	*used = nused;
 	*hits = nc_hits;
 	*misses = nc_misses;
+	spin_unlock(&nc_lock);
 }

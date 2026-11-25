@@ -120,6 +120,18 @@ struct vnode *vn_alloc(void);
 void	vn_ref(struct vnode *vp);
 
 /*
+ * P2: the name cache has to bump a reference while holding its own lock,
+ * because it validates vp->v_id against the cache entry and the slot must
+ * not be recycled in between.  vn_free() purges the name cache from inside
+ * the pool lock, so the fixed order is vfs_lock -> nc_lock: the cache takes
+ * the pool lock first and then calls the _locked form.
+ */
+/* 中文：名字缓存需在自己的锁内递增引用，因为要用 vp->v_id 与表项比对，中间不能让槽被回收；vn_free() 在池锁内清理名字缓存，故锁序固定为 vfs_lock -> nc_lock。 */
+void	vfs_pool_lock(void);
+void	vfs_pool_unlock(void);
+void	vn_ref_locked(struct vnode *vp);
+
+/*
  * Backends (S100.2a: tmpfs lives in tmpfs.c behind these, so vfs.c stays a
  * forwarding layer and the microkernel variant can replace the backend with
  * an IPC client without touching namei()/the mount table).

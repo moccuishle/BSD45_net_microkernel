@@ -39,7 +39,8 @@ static int vfs_root_src = VFS_ROOT_ISO;
  * P2: vnode pool lock.  It covers slot allocation, refcounts, v_id and the
  * directory-retention ring.  Backend lookups/reads still run under the BKL:
  * they may block on ATAPI, so they must never be called with this spinlock
- * held.  Lock order: vfs_lock -> pc_lock (vn_free -> pagecache_purge_vp).
+ * held.  Lock order: vfs_lock -> pc_lock (vn_free -> pagecache_purge_vp) and
+ * vfs_lock -> nc_lock (vn_free -> namecache_purge_vp).
  */
 static struct spinlock vfs_lock;
 
@@ -111,7 +112,35 @@ vn_ref(struct vnode *vp)
 	if (vp == 0)
 		return;
 	spin_lock(&vfs_lock);
-	vp->ref++;
+	vn_ref_locked(vp);
+	spin_unlock(&vfs_lock);
+}
+
+/* EN: vn_ref() with the pool lock already held (see the lock-order note in vfs.h). */
+/* 中文：调用者已持有池锁时的引用递增（锁序说明见 vfs.h）。 */
+void
+vn_ref_locked(struct vnode *vp)
+{
+
+	if (vp != 0)
+		vp->ref++;
+}
+
+/* EN: Export the pool lock for the name cache, whose lock is ordered inside it. */
+/* 中文：把池锁暴露给名字缓存使用（名字缓存的锁排在其内层）。 */
+void
+vfs_pool_lock(void)
+{
+
+	spin_lock(&vfs_lock);
+}
+
+/* EN: Release the pool lock taken by vfs_pool_lock(). */
+/* 中文：释放由 vfs_pool_lock() 取得的池锁。 */
+void
+vfs_pool_unlock(void)
+{
+
 	spin_unlock(&vfs_lock);
 }
 
