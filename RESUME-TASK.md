@@ -458,6 +458,44 @@ triple fault，而不是锁本身。
 aiotest 全过，0 TRAP；阻塞管道 `cat /readme.txt | head -5` 通过；`proctest`
 到 phase B（1002 live）0 异常，`cpu_reset` 日志只有启动/AP 初始化的实模式 reset。
 
+### 6.2.7 P2 第二步：page cache + buffer cache 加锁（2026-11-26）
+
+同样只加锁、不摘 BKL。两条缓存的共同原则：**锁只保护表，不跨设备访问**。
+`readraw()` → `bread()` → `atapi_read()` 是同步 PIO，持自旋锁做这个读会把
+其它 CPU 全程空转，一旦读写路径将来需要同一把锁就是硬死锁。
+
+- **`pc_lock`（`kernel/vm/pagecache.c`）**：保护 128 条 `pcs[]`、32 个哈希桶、
+  LRU 链、`refs` 与命中/缺失/填充/淘汰计数。所有 `pc_*` 内部辅助函数改成
+  "调用者必须持锁"。`pagecache_get()` 未命中时先在锁内 `pc_take()` 独占一个
+  条目（`used=1`、`refs=1`，**已脱离哈希与 LRU**），**放锁后**才做
+  `getattr`+`readraw` 填充，再回到锁内插入哈希。填充期间该条目对
+  `pc_find()` 不可见、`pc_take()` 拿不走、`pagecache_purge_vp()` 因
+  `refs != 0` 跳过，所以不需要额外状态位。
+- **`bio_lock`（`kernel/fs/vfs_bio.c`）**：保护 64 个 `bufs[]`、哈希链、LRU、
+  `b_refcnt` 与统计。原来的 `bio_evict()` 在锁内调 `bwrite()` 直接写盘，
+  现在拆成 `bio_evict()`（只摘链）+ `bio_take()`（摘链并清 `B_DIRTY`、递减
+  `bio_dirty`，通过 `*dirty` 告诉调用方欠一次回写），回写在**放锁后**做。
+- **唯一性**：`bread()`/`breada()` 在插入哈希前**二次 `bio_find()`**，若别的
+  CPU 已经发布了同一 `(dev,blkno)`，就丢弃自己读到的缓冲（`bio_reset()` +
+  挂回 LRU）并返回已发布的那一个。缓存里因此不会出现同一块的两份副本
+  （多份副本会让可写盘上的数据分叉）。代价只是极端并发下多读一次扇区。
+- **初始化**：`pc_inited`/`bio_inited` 改为**最后置位**，避免别的 CPU 看到
+  半成品表；两者都由 `vfs_init()` 在 `smp_init()` 之前调用，构建期是单 CPU，
+  所以 init 本身不加锁。
+- **锁序**：`vfs_lock -> pc_lock`（`vn_free -> pagecache_purge_vp`）、
+  `pc_lock -> page_lock`、`bio_lock -> page_lock`（均在 init 内）。
+  `pc_lock` 与 `bio_lock` **永不嵌套**：page cache 填充时 `pc_lock` 已释放。
+- **未做**：name-cache 表锁、fd 表锁；BKL 入口未动。
+
+**验证（2026-11-26）**：全套 25 PASS（同上两套已失效项）；`test_cache`/
+`test_mmap`/`test_mount`/`test_tools`/`test_s7`/`test_s3` 单独 PASS；8 核基线
+`pthread`/`pthmain`/`pthpre`/`aiotest` 全过、0 TRAP；阻塞管道
+（`cat /readme.txt | head -20` 让写端填满 4KB 并阻塞）正常；`aiotest` 在
+`pthpre` 之后连跑 4 轮全 PASS。有一次 8 核基线在 `aiotest` 处静止 13 分钟，
+但同一次 qdrive 已报 "boot timeout (no monitor prompt)"，且同一序列重跑
+4 次全过，判为 TCG 启动抖动；后续 soak 继续观察。
+
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -540,8 +578,10 @@ aiotest 全过，0 TRAP；阻塞管道 `cat /readme.txt | head -5` 通过；`pro
 
 > 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
 > BKL**，反过来必炸。第 ③ 步（7.3）排在它之后。
-> **进度（2026-11-26）**：VFS vnode 池与 pipe 表已加锁（§6.2.6）；pagecache /
-> buffer cache / name cache / fd 表仍未加锁，BKL 未动。
+> **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache 已
+> 加锁（§6.2.6、§6.2.7）；name cache / fd 表仍未加锁，BKL 未动。
+> 下一步按本文"一次一个子系统 + 一条路径"的规则，做 name cache 表锁，然后
+> 才是 fd 表。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近

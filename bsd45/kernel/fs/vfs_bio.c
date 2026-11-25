@@ -24,6 +24,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/smp.h>
 
 #include "atapi.h"
 #include "ata.h"
@@ -71,6 +72,19 @@ static int bio_inited;
 static unsigned bio_hits, bio_misses, bio_reads, bio_readahead;
 static unsigned bio_dirty;
 
+/*
+ * P2: buffer-cache table lock.  It covers the hash chains, the LRU,
+ * b_refcnt and the accounting counters, but never spans a device access:
+ * the sector read in bread()/breada() and the write-back in bio_evict()
+ * run with the lock dropped, because both are synchronous PIO and would
+ * otherwise spin every other CPU for the duration of the transfer.
+ * A buffer being filled is off the hash and off the LRU, so it is
+ * invisible to other CPUs until it is published.
+ * Lock order: bio_lock -> page_lock (bio_init -> vfs_page_alloc).
+ */
+/* 中文：P2 缓冲缓存表锁：保护哈希链、LRU、b_refcnt 与统计计数，但不跨越设备访问——扇区读与回写都在放锁后执行；正在填充的缓冲区不在哈希与 LRU 上，其它 CPU 看不到。 */
+static struct spinlock bio_lock;
+
 /* EN: Returns the hash bucket for a device and block number, hashing blkno with the 2654435761 multiplier, adding dev and taking the result modulo NBIOHASH. */
 /* 中文：计算设备号与块号对应的哈希桶：先用乘子 2654435761 散列 blkno，加上 dev 后对 NBIOHASH 取模并返回。 */
 static int
@@ -89,7 +103,11 @@ bio_init(void)
 
 	if (bio_inited)
 		return;
-	bio_inited = 1;
+	/*
+	 * Called from vfs_init() before smp_init() brings the APs online,
+	 * so the table is built uniprocessor; bio_inited is raised last.
+	 */
+	/* 中文：由 vfs_init() 在 smp_init() 启动 AP 之前调用，构建期是单 CPU；bio_inited 最后置位。 */
 	for (i = 0; i < NBIOHASH; i++)
 		bio_hash[i] = -1;
 	bio_lru_head = bio_lru_tail = -1;
@@ -110,9 +128,15 @@ bio_init(void)
 	}
 	bio_lru_head = 0;
 	bio_lru_tail = NBUF - 1;
+	bio_inited = 1;
 }
 
 /* ---------------------------------------------------------------- LRU */
+
+/*
+ * Every bio_ helper below runs with bio_lock held.
+ */
+/* 中文：下面所有 bio_ 内部辅助函数都在持有 bio_lock 时调用。 */
 
 /* EN: Unlinks buffer i from the doubly linked LRU list, repairing the neighbours and bio_lru_head/bio_lru_tail as needed, then clears its b_lprev and b_lnext links. */
 /* 中文：把缓冲区 i 从双向 LRU 链表中摘下，按需修正相邻节点以及 bio_lru_head/bio_lru_tail，最后把它的 b_lprev、b_lnext 置为 -1。 */
@@ -216,12 +240,13 @@ bio_read_block(unsigned dev, unsigned blkno, void *data)
 }
 
 /*
- * Take the least recently used buffer.  Dirty buffers are written back
- * first; if that fails the buffer is still recycled (a read-only CD never
- * produces dirty buffers, so this only matters once a disk exists).
+ * Detach the least recently used buffer so it can be reused.  The buffer
+ * keeps its b_dev/b_blkno/b_flags until the caller resets it, because a
+ * dirty buffer still has to be written back after the lock is dropped.
+ * Returns the index, or -1 when nothing is evictable.
  */
-/* EN: Reclaims the LRU-head buffer: unlinks it from the LRU and hash (if B_VALID), bwrite()s it when B_DIRTY, then clears flags, dev, blkno and refcount; -1 when the LRU is empty. */
-/* 中文：回收 LRU 链头的缓冲区：从 LRU 与哈希链（若 B_VALID）摘除，B_DIRTY 时用 bwrite() 回写，然后清标志、设备号、块号和引用计数；LRU 为空返回 -1。 */
+/* EN: Detaches the LRU-head buffer from the LRU (and the hash when B_VALID) and returns its index, leaving dev/blkno/flags intact so the caller can write it back unlocked; -1 when the LRU is empty. */
+/* 中文：把 LRU 链头缓冲区从 LRU（B_VALID 时也从哈希）摘下并返回其下标，保留 dev/blkno/flags 以便调用方在放锁后回写；LRU 为空返回 -1。 */
 static int
 bio_evict(void)
 {
@@ -233,51 +258,111 @@ bio_evict(void)
 	bio_lru_remove(i);
 	if (bufs[i].b_flags & B_VALID)
 		bio_hash_remove(i);
-	if (bufs[i].b_flags & B_DIRTY) {
-		(void)bwrite(&bufs[i]);
-		if (bio_dirty > 0)
-			bio_dirty--;
-	}
+	return (i);
+}
+
+/* EN: Clears the recycled buffer's flags, device, block number and reference count so it can be re-targeted at a new block. */
+/* 中文：清空被回收缓冲区的标志、设备号、块号与引用计数，以便重新指向新块。 */
+static void
+bio_reset(int i)
+{
+
 	bufs[i].b_flags = 0;
 	bufs[i].b_dev = 0;
 	bufs[i].b_blkno = 0;
 	bufs[i].b_refcnt = 0;
+}
+
+/* EN: Takes the lock, detaches an LRU buffer, and reports through *dirty whether a write-back is owed (the dirty flag is cleared and bio_dirty decremented under the lock). */
+/* 中文：加锁摘出一个 LRU 缓冲区；若它原先是脏的，则清掉 B_DIRTY、递减 bio_dirty 并通过 *dirty 告诉调用方需要回写。 */
+static int
+bio_take(int *dirty)
+{
+	int i;
+
+	*dirty = 0;
+	spin_lock(&bio_lock);
+	i = bio_evict();
+	if (i >= 0 && (bufs[i].b_flags & B_DIRTY)) {
+		bufs[i].b_flags &= ~B_DIRTY;
+		if (bio_dirty > 0)
+			bio_dirty--;
+		*dirty = 1;
+	}
+	spin_unlock(&bio_lock);
 	return (i);
 }
 
-/* EN: Returns a referenced buffer for dev/blkno: a hash hit just bumps b_refcnt, a miss evicts, reads the block and hash-inserts it; returns NULL on eviction or read failure. */
-/* 中文：取得 dev/blkno 对应缓冲并增加引用：哈希命中只递增 b_refcnt；未命中则淘汰一个缓冲区、读块并插入哈希；淘汰失败或读失败返回 NULL。 */
+/* EN: Returns a referenced buffer for dev/blkno: a hash hit just bumps b_refcnt; a miss evicts (writing back outside the lock), reads the block, then publishes it only if no other CPU published the same block meanwhile; NULL on eviction or read failure. */
+/* 中文：取得 dev/blkno 对应缓冲并增加引用：命中只递增 b_refcnt；未命中则淘汰（回写在锁外）、读块，并在插入哈希前二次确认没有别的 CPU 抢先发布同一块；淘汰或读失败返回 NULL。 */
 struct buf *
 bread(unsigned dev, unsigned blkno)
 {
-	int i;
+	int i, j, dirty, rv;
 	struct buf *bp;
 
 	if (!bio_inited)
 		bio_init();
+	spin_lock(&bio_lock);
 	i = bio_find(dev, blkno);
 	if (i >= 0) {
 		bio_hits++;
 		bio_lru_remove(i);
 		bufs[i].b_refcnt++;
-		return (&bufs[i]);
+		bp = &bufs[i];
+		spin_unlock(&bio_lock);
+		return (bp);
 	}
-	i = bio_evict();
+	spin_unlock(&bio_lock);
+
+	i = bio_take(&dirty);
 	if (i < 0)
 		return (0);
 	bp = &bufs[i];
+	if (dirty)
+		(void)bwrite(bp);	/* write-back: no lock held */
+
+	spin_lock(&bio_lock);
+	j = bio_find(dev, blkno);
+	if (j >= 0) {			/* lost the race: reuse the published one */
+		bio_reset(i);
+		bio_lru_append(i);
+		bufs[j].b_refcnt++;
+		bio_hits++;
+		bp = &bufs[j];
+		spin_unlock(&bio_lock);
+		return (bp);
+	}
 	bp->b_dev = dev;
 	bp->b_blkno = blkno;
 	bp->b_refcnt = 1;
-	if (bio_read_block(dev, blkno, bp->b_data) < 0) {
-		bp->b_flags = 0;
+	bp->b_flags = 0;
+	spin_unlock(&bio_lock);
+
+	rv = bio_read_block(dev, blkno, bp->b_data);
+
+	spin_lock(&bio_lock);
+	if (rv < 0) {
+		bio_reset(i);
 		bio_lru_append(i);
+		spin_unlock(&bio_lock);
 		return (0);
+	}
+	j = bio_find(dev, blkno);
+	if (j >= 0) {			/* another CPU published it while we read */
+		bio_reset(i);
+		bio_lru_append(i);
+		bufs[j].b_refcnt++;
+		bio_hits++;
+		bp = &bufs[j];
+		spin_unlock(&bio_lock);
+		return (bp);
 	}
 	bp->b_flags = B_VALID;
 	bio_hash_insert(i);
 	bio_misses++;
 	bio_reads++;
+	spin_unlock(&bio_lock);
 	return (bp);
 }
 
@@ -296,28 +381,52 @@ breada(unsigned dev, unsigned blkno, unsigned n)
 	if (!bio_inited)
 		bio_init();
 	for (k = 0; k < n; k++) {
-		int i;
+		int i, dirty, rv;
 		struct buf *bp;
 
-		if (bio_find(dev, blkno + k) >= 0)
+		spin_lock(&bio_lock);
+		if (bio_find(dev, blkno + k) >= 0) {
+			spin_unlock(&bio_lock);
 			continue;
-		i = bio_evict();
+		}
+		spin_unlock(&bio_lock);
+
+		i = bio_take(&dirty);
 		if (i < 0)
 			break;
 		bp = &bufs[i];
+		if (dirty)
+			(void)bwrite(bp);	/* write-back: no lock held */
+
+		spin_lock(&bio_lock);
 		bp->b_dev = dev;
 		bp->b_blkno = blkno + k;
 		bp->b_refcnt = 0;
-		if (bio_read_block(dev, bp->b_blkno, bp->b_data) < 0) {
-			bp->b_flags = 0;
+		bp->b_flags = 0;
+		spin_unlock(&bio_lock);
+
+		rv = bio_read_block(dev, bp->b_blkno, bp->b_data);
+
+		spin_lock(&bio_lock);
+		if (rv < 0) {
+			bio_reset(i);
 			bio_lru_append(i);
+			spin_unlock(&bio_lock);
 			break;
+		}
+		if (bio_find(dev, blkno + k) >= 0) {
+			/* already published by someone else: keep the cache unique */
+			bio_reset(i);
+			bio_lru_append(i);
+			spin_unlock(&bio_lock);
+			continue;
 		}
 		bp->b_flags = B_VALID;
 		bio_hash_insert(i);
 		bio_lru_append(i);
 		bio_readahead++;
 		bio_reads++;
+		spin_unlock(&bio_lock);
 	}
 }
 
@@ -331,6 +440,7 @@ brelse(struct buf *bp)
 	if (bp == 0 || bp < bufs || bp >= bufs + NBUF)
 		return;
 	i = bp - bufs;
+	spin_lock(&bio_lock);
 	if (bp->b_refcnt > 0)
 		bp->b_refcnt--;
 	if (bp->b_refcnt == 0) {
@@ -339,6 +449,7 @@ brelse(struct buf *bp)
 		    bio_lru_tail != i)
 			bio_lru_append(i);
 	}
+	spin_unlock(&bio_lock);
 }
 
 /* EN: Writes a buffer back, but there is no writable device yet: it returns -EINVAL for a NULL bp, -EROFS when bp belongs to the read-only CD device, and -ENXIO otherwise. */
@@ -354,7 +465,9 @@ bwrite(struct buf *bp)
 	if (bp->b_dev == BDEV_WD) {
 		if (ata_write(bp->b_blkno * 4, 4, bp->b_data) < 0)
 			return (-EIO);
+		spin_lock(&bio_lock);
 		bp->b_flags &= ~B_DIRTY;
+		spin_unlock(&bio_lock);
 		return (0);
 	}
 	return (-ENXIO);
@@ -368,10 +481,12 @@ bdwrite(struct buf *bp)
 
 	if (bp == 0)
 		return;
+	spin_lock(&bio_lock);
 	bp->b_flags |= B_DIRTY;
 	bio_dirty++;
 	if (bp->b_refcnt == 0 && bp->b_lprev < 0 && bp->b_lnext < 0)
 		bio_lru_append(bp - bufs);
+	spin_unlock(&bio_lock);
 }
 
 /* EN: Returns the buffer's b_data pointer to its mapped page, or NULL when bp is NULL. */
@@ -383,14 +498,15 @@ buf_data(struct buf *bp)
 	return (bp ? bp->b_data : 0);
 }
 
-/* EN: Fills caller-supplied counters with buffer-pool figures: total NBUF, used counted by scanning B_VALID, and the bio_hits/misses/reads/readahead/dirty globals; no locking. */
-/* 中文：把缓冲池统计数据写入调用方给出的计数器：总数取 NBUF，扫描 B_VALID 统计已用缓冲区数，其余取自 bio_hits/misses/reads/readahead/dirty 全局计数；不加锁。 */
+/* EN: Fills caller-supplied counters with buffer-pool figures under bio_lock: total NBUF, used counted by scanning B_VALID, and the bio_hits/misses/reads/readahead/dirty globals. */
+/* 中文：在 bio_lock 保护下把缓冲池统计数据写入调用方计数器：总数 NBUF、扫描 B_VALID 得到的已用数，以及 bio_hits/misses/reads/readahead/dirty。 */
 void
 bio_stats(unsigned *total, unsigned *used, unsigned *hits, unsigned *misses,
     unsigned *reads, unsigned *readahead, unsigned *dirty)
 {
 	int i, nused = 0;
 
+	spin_lock(&bio_lock);
 	for (i = 0; i < NBUF; i++)
 		if (bufs[i].b_flags & B_VALID)
 			nused++;
@@ -401,4 +517,5 @@ bio_stats(unsigned *total, unsigned *used, unsigned *hits, unsigned *misses,
 	*reads = bio_reads;
 	*readahead = bio_readahead;
 	*dirty = bio_dirty;
+	spin_unlock(&bio_lock);
 }

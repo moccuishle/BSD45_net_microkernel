@@ -39,7 +39,7 @@ static int vfs_root_src = VFS_ROOT_ISO;
  * P2: vnode pool lock.  It covers slot allocation, refcounts, v_id and the
  * directory-retention ring.  Backend lookups/reads still run under the BKL:
  * they may block on ATAPI, so they must never be called with this spinlock
- * held.  Lock order: vfs_lock -> page_lock (vn_free -> pagecache_purge_vp).
+ * held.  Lock order: vfs_lock -> pc_lock (vn_free -> pagecache_purge_vp).
  */
 static struct spinlock vfs_lock;
 

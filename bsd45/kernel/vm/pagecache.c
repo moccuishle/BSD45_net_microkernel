@@ -28,6 +28,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/smp.h>
 
 #include "vfs.h"
 #include "thread/kthread.h"
@@ -67,6 +68,17 @@ static int pc_inited;
 
 static unsigned pc_hits, pc_misses, pc_fills, pc_evicts;
 
+/*
+ * P2: page-cache table lock.  It covers the hash buckets, the LRU, refs
+ * and the hit/miss counters.  The fill path drops it around
+ * ops->readraw(), which is synchronous ATAPI PIO: holding a spinlock
+ * across that read would spin every other CPU for the whole transfer.
+ * Lock order: vfs_lock -> pc_lock (vn_free -> pagecache_purge_vp);
+ * pc_lock -> page_lock (pagecache_init -> vfs_page_alloc).
+ */
+/* 中文：P2 页缓存表锁：保护哈希桶、LRU、refs 与命中计数；填充路径在 ops->readraw() 前后放锁，避免持锁做 ATAPI 同步 PIO。 */
+static struct spinlock pc_lock;
+
 /* A read-only backend with a stable identity may use its v_key. */
 /* EN: Returns 0 for a null vnode, else the vnode's stable v_key when set (immutable extents) or its v_id for tmpfs, the key used by the hash and LRU. */
 /* 中文：空 vnode 返回 0；否则优先返回已设置的稳定 v_key（不可变数据区），tmpfs 则返回 v_id，作为哈希与 LRU 使用的键。 */
@@ -91,6 +103,12 @@ pc_hashfn(unsigned key, unsigned pindex)
 }
 
 /* ---------------------------------------------------------------- LRU */
+
+/*
+ * Every pc_* helper below runs with pc_lock held; they are the "locked"
+ * half of the API and never touch a device or the page allocator.
+ */
+/* 中文：下面所有 pc_* 辅助函数都在持有 pc_lock 时调用，属于已加锁的内部接口，不访问设备与页分配器。 */
 
 /* EN: Unlinks entry i from the doubly linked LRU index list, repairing pc_lru_head/pc_lru_tail, and clears its links and onlru; no-op if it is not on the LRU. */
 /* 中文：把条目 i 从双向 LRU 索引链中摘除并修正 pc_lru_head/pc_lru_tail，清空链指针与 onlru；不在 LRU 上则直接返回。 */
@@ -230,7 +248,13 @@ pagecache_init(void)
 
 	if (pc_inited)
 		return;
-	pc_inited = 1;
+	/*
+	 * Runs from vfs_init() while the machine is still uniprocessor
+	 * (before smp_init() starts the APs), so the table needs no lock
+	 * here; pc_inited is raised last so a late caller never sees a
+	 * half-built cache.
+	 */
+	/* 中文：本函数由 vfs_init() 在单 CPU 阶段调用（smp_init() 尚未启动 AP），因此无需加锁；pc_inited 最后置位，避免其它 CPU 看到半成品。 */
 	for (i = 0; i < PCHASH; i++)
 		pc_hash[i] = -1;
 	pc_lru_head = pc_lru_tail = -1;
@@ -249,6 +273,7 @@ pagecache_init(void)
 		pc_lru_add(i);
 	}
 	pc_hits = pc_misses = pc_fills = pc_evicts = 0;
+	pc_inited = 1;
 }
 
 /* ---------------------------------------------------------------- API */
@@ -274,6 +299,7 @@ pagecache_get(struct vnode *vp, unsigned pindex, unsigned char **vap)
 	key = pagecache_key(vp);
 	if (key == 0)
 		return (0);
+	spin_lock(&pc_lock);
 	i = pc_find(key, pindex);
 	if (i >= 0) {
 		e = &pcs[i];
@@ -281,19 +307,30 @@ pagecache_get(struct vnode *vp, unsigned pindex, unsigned char **vap)
 		pc_lru_del(i);
 		e->refs++;
 		*vap = e->va;
+		spin_unlock(&pc_lock);
 		return (e->pa);
 	}
 	i = pc_take();
 	if (i < 0) {
+		spin_unlock(&pc_lock);
 		/* S21: ask the softirq thread to reclaim in its own context */
 		softint_schedule(SOFT_RECLAIM);
 		return (0);
 	}
+	/*
+	 * Take ownership of the entry for the fill: it is off the hash and
+	 * off the LRU with refs=1, so pc_find() cannot see it, pc_take()
+	 * cannot recycle it and purge skips it (refs != 0).  The read below
+	 * therefore runs with no lock held.
+	 */
+	/* 中文：填充期间独占该条目：它已脱离哈希与 LRU 且 refs=1，pc_find() 看不到、pc_take() 拿不走、purge 会跳过，故下面的读操作无需持锁。 */
 	e = &pcs[i];
 	e->used = 1;
 	e->key = key;
 	e->pindex = pindex;
 	e->refs = 1;
+	spin_unlock(&pc_lock);
+
 	bzero(e->va, PAGE_SIZE);
 	if (vp->ops->getattr)
 		vp->ops->getattr(vp, &mode, &size);
@@ -301,20 +338,24 @@ pagecache_get(struct vnode *vp, unsigned pindex, unsigned char **vap)
 	n = (size > start) ? (size - start) : 0;
 	if (n > PAGE_SIZE)
 		n = PAGE_SIZE;
-	if (n > 0 && vp->ops->readraw != 0) {
+	rv = 0;
+	if (n > 0 && vp->ops->readraw != 0)
 		rv = vp->ops->readraw(vp, start, e->va, n);
-		if (rv < 0) {
-			e->used = 0;
-			e->refs = 0;
-			e->key = e->pindex = 0;
-			pc_lru_add(i);
-			return (0);
-		}
+
+	spin_lock(&pc_lock);
+	if (rv < 0) {
+		e->used = 0;
+		e->refs = 0;
+		e->key = e->pindex = 0;
+		pc_lru_add(i);
+		spin_unlock(&pc_lock);
+		return (0);
 	}
 	pc_hash_insert(i);
 	pc_misses++;
 	pc_fills++;
 	*vap = e->va;
+	spin_unlock(&pc_lock);
 	return (e->pa);
 }
 
@@ -370,14 +411,18 @@ pagecache_unref_key(unsigned key, unsigned pindex)
 
 	if (!pc_inited || key == 0)
 		return (0);
+	spin_lock(&pc_lock);
 	i = pc_find(key, pindex);
-	if (i < 0)
+	if (i < 0) {
+		spin_unlock(&pc_lock);
 		return (0);
+	}
 	if (pcs[i].refs > 0) {
 		pcs[i].refs--;
 		if (pcs[i].refs == 0)
 			pc_lru_add(i);
 	}
+	spin_unlock(&pc_lock);
 	return (1);
 }
 
@@ -410,9 +455,11 @@ pagecache_purge_vp(struct vnode *vp)
 	key = vp->v_id;
 	if (key == 0)
 		return;
+	spin_lock(&pc_lock);
 	for (i = 0; i < NPCACHE; i++)
 		if (pcs[i].used && pcs[i].key == key && pcs[i].refs == 0)
 			pc_release(i);
+	spin_unlock(&pc_lock);
 }
 
 /* EN: Counts used entries and reports NPCACHE as total plus the accumulated hit, miss, fill and evict counters through the six output pointers. */
@@ -423,6 +470,7 @@ pagecache_stats(unsigned *total, unsigned *used, unsigned *hits,
 {
 	int i, nused = 0;
 
+	spin_lock(&pc_lock);
 	for (i = 0; i < NPCACHE; i++)
 		nused += pcs[i].used;
 	*total = NPCACHE;
@@ -431,6 +479,7 @@ pagecache_stats(unsigned *total, unsigned *used, unsigned *hits,
 	*misses = pc_misses;
 	*fills = pc_fills;
 	*evicts = pc_evicts;
+	spin_unlock(&pc_lock);
 }
 
 /*
@@ -446,12 +495,14 @@ pagecache_reclaim(unsigned n)
 
 	if (!pc_inited)
 		return (0);
+	spin_lock(&pc_lock);
 	while (count < (int)n) {
 		i = pc_take();
 		if (i < 0)
 			break;
 		count++;
 	}
+	spin_unlock(&pc_lock);
 	if (count > 0)
 		pc_evicts += 0;		/* pc_take already counted */
 	return (count);
