@@ -3384,41 +3384,88 @@ pipe_wake_writer_locked(struct pipe *pp, int epipe)
 	proc_wake(p);
 }
 
-/* 中文：关闭文件描述符：管道端减少读/写者计数并按需唤醒对端，释放 vnode 引用，最后标记 fd 空闲 */
-/* EN: Close a file descriptor: decrement pipe reader/writer counts and wake peers as needed, drop the vnode reference and mark the fd free */
+/*
+ * Shared body of fd teardown.  The descriptor is claimed under fd_lock
+ * first -- the fields it needs afterwards (pipe index, direction, vnode)
+ * are copied into locals, so the slot can be recycled the moment the lock
+ * is dropped.  The pipe accounting and the vnode release both only need
+ * their own locks (pipe_lock, vfs_lock -> pc/nc_lock), so syscall context
+ * can run them with the BKL released.
+ * 中文：fd 拆除的公共体。先在 fd_lock 内认领描述符，把它后面需要的字段
+ * （管道下标、方向、vnode）拷进局部变量，这样一放开锁槽位就可以被复用。
+ * 管道计账与 vnode 释放都只依赖各自的锁（pipe_lock、vfs_lock -> pc/nc_lock），
+ * 因此系统调用上下文可以在放掉 BKL 的情况下执行它们。
+ */
 static void
-fd_close(int fd)
+fd_close_common(int fd, int bklfree)
 {
 	struct kfd *fp;
 	struct pipe *pp;
+	struct vnode *vp;
+	int pidx, prw;
 
-	if (fd < 0 || fd >= NFD || !cur->uk_fds[fd].used)
+	if (fd < 0 || fd >= NFD)
 		return;
+	spin_lock(&fd_lock);
 	fp = &cur->uk_fds[fd];
-	if (fp->type == FD_PIPE && fp->pipeidx >= 0 &&
-	    fp->pipeidx < NPIPE) {
-		pp = &pipes[fp->pipeidx];
+	if (!fp->used) {
+		spin_unlock(&fd_lock);
+		return;
+	}
+	pidx = (fp->type == FD_PIPE && fp->pipeidx >= 0 &&
+	    fp->pipeidx < NPIPE) ? fp->pipeidx : -1;
+	prw = fp->rw;
+	vp = fp->vp;
+	fp->vp = 0;
+	fp->pipeidx = -1;
+	fp->used = 0;
+	spin_unlock(&fd_lock);
+
+	/*
+	 * §7.2.1 item 7: close(2)/dup2(2) tear the descriptor down with the
+	 * BKL released.  vn_put() may free the vnode (name cache + page
+	 * cache purge), and closing the last writer wakes a blocked reader
+	 * -- both are lock-driven and must not stall the other CPUs for the
+	 * whole teardown.  exec's own fd sweep still passes bklfree == 0:
+	 * there the process image is being replaced and the BKL is doing
+	 * useful work.
+	 * 中文：§7.2.1 第 7 条：close(2)/dup2(2) 在放掉 BKL 的情况下拆除描述符。
+	 * vn_put() 可能释放 vnode（名字缓存 + 页缓存 purge），关掉最后一个写端
+	 * 还会唤醒阻塞的读者——这些都只靠各自的锁，不该为整个拆除过程把其它核
+	 * 卡住。exec 自己的 fd 清扫仍传 bklfree == 0：那里正在替换进程映像，
+	 * BKL 在做有用的事。
+	 */
+	if (bklfree)
+		smp_bkl_drop();
+	if (pidx >= 0) {
+		pp = &pipes[pidx];
 		spin_lock(&pipe_lock);
-		if (fp->rw == 1)
+		if (prw == 1)
 			pp->readers--;
-		else if (fp->rw == 2)
+		else if (prw == 2)
 			pp->writers--;
 		if (pp->readers <= 0)
 			pipe_wake_writer_locked(pp, 1);
 		if (pp->writers <= 0)
 			pipe_wake_reader_locked(pp, 1);
 		if (pp->readers <= 0 && pp->writers <= 0 &&
-		    pp->wpid == 0 && pp->rpid == 0) {
+		    pp->wpid == 0 && pp->rpid == 0)
 			pp->used = 0;
-			fp->pipeidx = -1;
-		}
 		spin_unlock(&pipe_lock);
 	}
-	if (fp->vp != 0) {
-		vn_put(fp->vp);
-		fp->vp = 0;
-	}
-	fp->used = 0;
+	if (vp != 0)
+		vn_put(vp);
+	if (bklfree)
+		smp_bkl_enter();
+}
+
+/* 中文：关闭文件描述符：管道端减少读/写者计数并按需唤醒对端，释放 vnode 引用，最后标记 fd 空闲 */
+/* EN: Close a file descriptor: decrement pipe reader/writer counts and wake peers as needed, drop the vnode reference and mark the fd free */
+static void
+fd_close(int fd)
+{
+
+	fd_close_common(fd, 0);
 }
 
 /* 中文：为 fd 结构持有的 vnode 增加一次引用计数 */
@@ -6720,7 +6767,9 @@ bsd45_syscall(struct sysregs *r)
 			r->eax = (unsigned)-EIO;	/* 服务端口无属主 / 已有在途事务 */
 			break;
 		}
-		fd_close((int)r->ebx);
+		/* §7.2.1 item 7: the teardown runs without the BKL. */
+		/* 中文：§7.2.1 第 7 条：拆除过程不持 BKL。 */
+		fd_close_common((int)r->ebx, 1);
 		r->eax = 0;
 		break;
 	}

@@ -821,6 +821,35 @@ pid，这一条只补两处：
 8 核 3 GB 基线全过，**0 TRAP / triple fault / STACK OVERFLOW / address space
 busy**，`exit 0`。
 
+### 6.2.16 P2 第十一步：close(2) 摘 BKL（open 仍留 BKL）（2026-11-28）
+
+按 §7.2.1 第 7 条，但只做能做的那一半：**close 摘掉，open/namei 不动**。
+
+- **为什么 open 不能跟着做**：open 的主体是 `vfs_namei()`，它整条路径不持锁
+  （§6.2.6 已经写明原因：后端 `lookup` 会走 ATAPI 阻塞 I/O，不能拿自旋锁），
+  靠 BKL 保护"查 name cache + 给 vnode 加引用"这一个原子动作。要摘它，先得
+  设计**路径级锁**（或把 name-cache 查询与 vnode 引用合成一个操作），
+  这是独立一块工作，不适合塞进这一步。硬塞的结果是 namei 与 `vn_free()`
+  抢同一个 vnode，正是 §7.2.1 结尾提醒的那类复活已释放 vnode 的 bug。
+- **close 的改造**：`fd_close()` 拆成 `fd_close_common(fd, bklfree)`：
+  1. `fd_lock` 内**先认领**描述符——把 `pipeidx`/`rw`/`vp` 拷进局部变量，
+     然后 `fp->vp = 0`、`fp->pipeidx = -1`、`fp->used = 0`。一次放锁就把
+     槽位还回去，后面只用局部值，不怕槽位被别人复用。
+  2. `pipe_lock` 里减读写端计数、按需 `pipe_wake_{reader,writer}_locked()`
+     唤醒对端（EOF/EPIPE）；最后 `vn_put(vp)`。
+  3. 这些只需要 `pipe_lock` 和 `vfs_lock -> pc_lock / nc_lock`，都不需要
+     BKL，所以 `bklfree == 1` 时在它们外面 `smp_bkl_drop()/enter()`。
+- **`bklfree` 只给 close(2) 传 1**：
+  - `exec` 的 fd 清扫传 0——那里正在替换进程映像，BKL 在做有用的事。
+  - `dup2` 也传 0——它需要在 `fd_close(to)` 之后**紧接着**用
+    `cur->uk_fds[to] = cur->uk_fds[from]` 覆盖同一个槽位；中途放 BKL 的话，
+    另一个核可能先把 `to` open 走了，赋值就盖掉了别人的 fd。close(2) 没有
+    这个"关掉再立刻重写"的序列，可以安全放开。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**；
+8 核 3 GB 基线全过，**0 TRAP / triple fault / STACK OVERFLOW /
+address space busy**，`exit 0`。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -984,11 +1013,14 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    `spltty()` 屏蔽 IRQ）。写端仍未摘：`crt_row/crt_col`/`klog_len` 本来就没有
    锁，且 `panic()` 也走 `printf()`，给 `pccnputc()` 加锁必须先做"panic 无锁
    旁路"。
-7. **`open` / `close`**：最后做。要连带 **namei 的路径级锁**（现在
-   `vfs_namei()` 整条路径不持锁、靠 BKL）与 vnode 生命周期（`vn_put` →
-   `dir_cache_keep` / `vn_free`）。`close` 还要处理 fd 与 pipe/vnode 的
-   引用释放顺序，别在 `fd_lock` 里 `vn_put`（§6.2.9 已经示范了"先放锁再
-   `vn_put`"）。
+7. **`close` / `open`**：**`close(2)` 已完成**（§6.2.16）：`fd_close()`
+   拆成 `fd_close_common(fd, bklfree)`，`fd_lock` 内认领描述符并取出
+   `vp/pipeidx/rw` 到局部，放锁后 `pipe_lock` 计账 + `vn_put()`，在 BKL 外
+   执行。`exec` 清扫与 `dup2` 仍传 0（后者"关掉再立刻重写同一槽位"，
+   中途放锁会被别的核抢走）。**`open` 未做**：主体是 `vfs_namei()`，整条路径
+   不持锁、靠 BKL，要摘必须先做**namei 路径级锁**（把"查 name cache + 加
+   vnode 引用"合成一个原子动作），否则会和 `vn_free()` 抢同一个 vnode
+   （复活已释放 vnode）。这是下一步。
 
 配套要做的事：
 - **P1 仍未收口**：`smp_user_dispatch` 默认值还是 0。要改成 1，需要一次
