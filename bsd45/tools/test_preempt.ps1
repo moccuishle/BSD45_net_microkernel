@@ -36,14 +36,19 @@ Check "timer"   $log @("spin: timer ok")
 Check "verdict" $log @("spin: PASS")
 
 # The A/B run between the exec line and the summary is the evidence.  Count
-# transitions: a non-preemptive scheduler produces one (all B, then all A).
+# transitions: a non-preemptive scheduler produces exactly one (all B, then
+# all A).  The threshold is 3, not 4: with 30 letters per process the guest
+# lands on 3..5 transitions depending on how many letters fit in one
+# quantum, so a threshold of 4 sat right on the boundary and failed ~10% of
+# runs on an unchanged kernel.  3 still requires a switch away *and* back,
+# which a non-preemptive scheduler cannot produce.
 $m = [regex]::Match($log, '([AB]{8,})')
 if ($m.Success) {
     $run = $m.Groups[1].Value
     $trans = 0
     for ($i = 1; $i -lt $run.Length; $i++) { if ($run[$i] -ne $run[$i-1]) { $trans++ } }
     Write-Host ("  info scheduler letters: {0} chars, {1} transitions" -f $run.Length, $trans)
-    if ($trans -ge 4) {
+    if ($trans -ge 3) {
         Write-Host "  ok   two processes interleaved under the timer" -ForegroundColor Green
     } else {
         Write-Host "  FAIL no interleaving: scheduler did not preempt" -ForegroundColor Red

@@ -26,7 +26,10 @@ run="$(printf '%s' "$log" | grep -oE '^[AB]+$' | head -1 || true)"
 if [ -n "$run" ]; then
     trans=$(printf '%s' "$run" | awk '{n=0; for(i=2;i<=length($0);i++) if(substr($0,i,1)!=substr($0,i-1,1)) n++; print n}')
     echo "  info scheduler letters: ${#run} chars, $trans transitions"
-    if [ "$trans" -ge 4 ]; then echo "  ok   two processes interleaved under the timer"
+    # 3, not 4: a non-preemptive scheduler yields exactly 1 transition, and
+    # the observed distribution for 30 letters is 3..5, so 4 was a boundary
+    # value.  See test_preempt.ps1 for the full rationale.
+    if [ "$trans" -ge 3 ]; then echo "  ok   two processes interleaved under the timer"
     else echo "  FAIL no interleaving" >&2; fails=$((fails+1)); fi
 else
     echo "  FAIL could not find A/B run" >&2; fails=$((fails+1))

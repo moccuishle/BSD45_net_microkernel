@@ -760,6 +760,41 @@ STACK OVERFLOW / address space busy**，`ps` 正常，`exit 0` 干净退出。
 8 核 3 GB 基线 `pthread`/`pthmain`/`pthpre`/`aiotest` 全过，
 **0 TRAP / triple fault / STACK OVERFLOW / address space busy**，`exit 0`。
 
+### 6.2.14 P2 第八步：pipe read/write 摘 BKL（2026-11-28）
+
+按 §7.2.1 第 5 条。`pipe_lock` 早已覆盖 8 个槽的读写者计数、环形位置和阻塞
+pid，这一条只补两处：
+
+- **BKL 在 `kthread_block_tcb()` 之前就放**：原来阻塞路径持着 BKL 一直到
+  `proc_sched()` 才放手（`proc_sched()` 开头 `smp_bkl_drop()`）。现在先
+  `smp_bkl_drop()` 再进 `pipe_lock`，停机的核不会占着 BKL。关键点：
+  **`smp_bkl_drop()` 是嵌套安全的**（`if (!smp_bkl_held()) return;`），
+  所以 `proc_sched()` 里的那次释放自动退化成空操作，不需要加"是否已释放"的
+  标志位。非阻塞路径在 `smp_bkl_enter()` 之后才写 `r->eax`，因为
+  返回前的 `softirq_dispatch()` 仍需要 BKL。
+- **唤醒契约的发布顺序**：`uk_regs`/`uk_pipeidx`/`uk_piperw`/`uk_pipeat`/
+  `uk_pipelen` 与 `pp->rpid`（写端是 `wpid`）**全部在 `pipe_lock` 内、
+  `kthread_block_tcb()` 之前**写好。原来顺序是"先 block 再登记"，虽然
+  `kthread_block_tcb()` 只入队不切换、且整段持 `pipe_lock`，唤醒方进不来，
+  但顺序反着写属于"靠锁保护一个本可以自证的顺序"，现在改成直读即正确。
+- **fd 校验**：`fd_lock` 内校验 `used/type/rw` 再取出 `pp`，**放开 `fd_lock`
+  之后**才取 `pipe_lock`，避免引入 `fd_lock -> pipe_lock` 嵌套（`fd_close()`
+  也是只持 `pipe_lock`）。
+- **锁序不变**：`pipe_lock -> sc_rqlock`（`proc_wake`/`sched_runnable`）。
+  `proc_wake()` 在没有 BKL 的情况下跑是安全的：`P_FREE`/`P_EXITING` 的检查
+  本来就是为 S425（`proc_exit` 会放 BKL）加的，运行队列由 `sc_rqlock` 保护。
+- **`test_preempt` 判据修正**：这条测试要求两个死循环进程的 A/B 输出至少
+  4 次跳变，但实测分布是 **3～5 次**（30 个字母/进程，每个 quantum 能塞几个
+  字母是随机的），阈值 4 正好压在边界上，未改内核的对照版 8 次里也有 1 次
+  失败。改为 **≥3**：无抢占时恰好 **1** 次跳变（全是 A 再全是 B），3 次已经
+  要求"切出去再切回来"，判据强度不变。`.ps1`/`.sh` 两份同步改。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**（60s）；
+8 核 3 GB 基线 `pthread`/`pthmain`/`pthpre`/`aiotest` 全过，
+额外跑 `echo hello-pipe | cat`、`cat /readme.txt | head -5` 两条管道，
+**0 TRAP / triple fault / STACK OVERFLOW / address space busy**，`exit 0`。
+`test_preempt` 单独复跑 12 次，跳变 3～5，全部 PASS。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -912,9 +947,11 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    `pagecache_purge_vp()` 移到锁外；`write(2)` 已按 `read(2)` 模板摘 BKL
    （只放行 tmpfs，JLFS 仍由 BKL 串行）。顺带修掉一个已在线上的缺锁 bug：
    `readraw` 早就在 BKL 外跑，却没有任何节点锁。
-5. **pipe read/write**：`pipe_lock` 已在，但阻塞路径要在 `kthread_block_tcb()`
-   之前把 BKL 也放掉（现在只在 `proc_sched()` 前放），并且
-   `uk_pipeidx/uk_piperw/uk_pipeat/uk_pipelen` 的写入顺序要与唤醒方对齐。
+5. **pipe read/write** ✅ 已完成（§6.2.14）：`pipe_lock` 在；阻塞路径改为在
+   `kthread_block_tcb()` **之前**就 `smp_bkl_drop()`（`smp_bkl_drop()` 嵌套
+   安全，`proc_sched()` 里的再次释放退化为空操作），唤醒契约
+   （`uk_regs`/`uk_pipeidx`/`uk_piperw`/`uk_pipeat`/`uk_pipelen`/`rpid`）
+   在锁内、阻塞前一次性发布。
 6. **console/tty read/write**：需要先有 tty 锁，`tty_tb.c` 里的环形缓冲目前
    全靠 BKL。
 7. **`open` / `close`**：最后做。要连带 **namei 的路径级锁**（现在

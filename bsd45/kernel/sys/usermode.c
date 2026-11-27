@@ -6217,29 +6217,39 @@ bsd45_syscall(struct sysregs *r)
 			break;
 		}
 		if (cur->uk_fds[fd].used && cur->uk_fds[fd].type == FD_PIPE) {
-			struct pipe *pp = &pipes[cur->uk_fds[fd].pipeidx];
+			struct pipe *pp;
 			unsigned space, n, first;
 
-			spin_lock(&pipe_lock);
-			if (cur->uk_fds[fd].rw != 2) {
-				spin_unlock(&pipe_lock);
+			/* §7.2.1 item 5: same shape as the read side. */
+			/* 中文：§7.2.1 第 5 条：与读端同构。 */
+			spin_lock(&fd_lock);
+			if (!cur->uk_fds[fd].used ||
+			    cur->uk_fds[fd].type != FD_PIPE ||
+			    cur->uk_fds[fd].rw != 2) {
+				spin_unlock(&fd_lock);
 				r->eax = (unsigned)-EBADF;
 				break;
 			}
+			pp = &pipes[cur->uk_fds[fd].pipeidx];
+			spin_unlock(&fd_lock);
+
+			smp_bkl_drop();
+			spin_lock(&pipe_lock);
 			if (pp->readers <= 0) {
 				spin_unlock(&pipe_lock);
+				smp_bkl_enter();
 				r->eax = (unsigned)-EPIPE;
 				break;
 			}
 			space = PIPESZ - pp->count;
 			if (space == 0) {
 				cur->uk_regs = *r;
-				kthread_block_tcb(0);
 				cur->uk_pipeidx = pp - pipes;
 				cur->uk_piperw = 2;
 				cur->uk_pipeat = buf;
 				cur->uk_pipelen = len;
 				pp->wpid = cur->uk_pid;
+				kthread_block_tcb(0);
 				spin_unlock(&pipe_lock);
 				proc_sched();
 				break;		/* resumed by the reader */
@@ -6504,28 +6514,56 @@ bsd45_syscall(struct sysregs *r)
 			break;
 		}
 		if (cur->uk_fds[fd].type == FD_PIPE) {
-			struct pipe *pp = &pipes[cur->uk_fds[fd].pipeidx];
+			struct pipe *pp;
 			unsigned n, first;
 
-			spin_lock(&pipe_lock);
-			if (cur->uk_fds[fd].rw != 1) {
-				spin_unlock(&pipe_lock);
+			/*
+			 * §7.2.1 item 5: pipe read leaves the BKL.
+			 * The descriptor is checked under fd_lock and that lock
+			 * is released before pipe_lock, so no fd_lock ->
+			 * pipe_lock nesting is introduced.  The ring copy then
+			 * runs with pipe_lock alone.  The blocking branch drops
+			 * the BKL *before* kthread_block_tcb() so a parked CPU
+			 * never sits on the BKL (smp_bkl_drop() is nesting-safe,
+			 * so proc_sched()'s own drop is a no-op), and publishes
+			 * the whole wake-up contract -- uk_regs, uk_pipeidx,
+			 * uk_piperw, uk_pipeat, uk_pipelen and pp->rpid --
+			 * inside pipe_lock, in the order the waker reads them.
+			 * 中文：§7.2.1 第 5 条：pipe 读摘掉 BKL。fd 在 fd_lock 内校验，
+			 * 并在取 pipe_lock 之前放开，避免 fd_lock -> pipe_lock 嵌套；
+			 * 环形拷贝只持 pipe_lock。阻塞分支在 kthread_block_tcb() 之前就
+			 * 放掉 BKL，停机的核不会占着 BKL（smp_bkl_drop 可嵌套，proc_sched
+			 * 里的再次释放变成空操作），并按唤醒方读取的顺序在 pipe_lock 内
+			 * 一次性发布 uk_regs/uk_pipeidx/uk_piperw/uk_pipeat/uk_pipelen
+			 * 与 pp->rpid。
+			 */
+			spin_lock(&fd_lock);
+			if (!cur->uk_fds[fd].used ||
+			    cur->uk_fds[fd].type != FD_PIPE ||
+			    cur->uk_fds[fd].rw != 1) {
+				spin_unlock(&fd_lock);
 				r->eax = (unsigned)-EBADF;
 				break;
 			}
+			pp = &pipes[cur->uk_fds[fd].pipeidx];
+			spin_unlock(&fd_lock);
+
+			smp_bkl_drop();
+			spin_lock(&pipe_lock);
 			if (pp->count == 0) {
 				if (pp->writers <= 0) {		/* EOF */
 					spin_unlock(&pipe_lock);
+					smp_bkl_enter();
 					r->eax = 0;
 					break;
 				}
 				cur->uk_regs = *r;
-				kthread_block_tcb(0);
 				cur->uk_pipeidx = pp - pipes;
 				cur->uk_piperw = 1;
 				cur->uk_pipeat = buf;
 				cur->uk_pipelen = len;
 				pp->rpid = cur->uk_pid;
+				kthread_block_tcb(0);
 				spin_unlock(&pipe_lock);
 				proc_sched();
 				break;		/* resumed by the writer */
@@ -6543,6 +6581,7 @@ bsd45_syscall(struct sysregs *r)
 			pp->count -= n;
 			pipe_wake_writer_locked(pp, 0);
 			spin_unlock(&pipe_lock);
+			smp_bkl_enter();
 			r->eax = n;
 			break;
 		}
