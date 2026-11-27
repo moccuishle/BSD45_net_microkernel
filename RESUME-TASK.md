@@ -795,6 +795,32 @@ pid，这一条只补两处：
 **0 TRAP / triple fault / STACK OVERFLOW / address space busy**，`exit 0`。
 `test_preempt` 单独复跑 12 次，跳变 3～5，全部 PASS。
 
+### 6.2.15 P2 第九步：console 读等键时放掉 BKL（2026-11-28）
+
+按 §7.2.1 第 6 条。先纠正文档里的一个前提：**不需要新建 tty 锁**。
+`console_read()` → `cngetc()` → `pccngetc()` 的取字符是在 `spltty()` 里做的
+（`kernel/arch/i386/isa/pccons.c:399`），取字符期间键盘 IRQ 被屏蔽，
+环形的 head/tail 不可能被读到"半更新"状态。真正的 SMP 问题是另一件事：
+
+- **一个停在提示符的 shell 会把整台机器饿死**：`console_read()` 的循环
+  `c = cngetc(); if (c == 0) continue;` 一直持着 BKL 轮询，用户不敲键就一直
+  不放手。修法是**只在轮询那一小段 `smp_bkl_drop()`，取到字符立刻
+  `smp_bkl_enter()`**。行规程缓冲、回显、以及 `^C`/`^Z`/`^\` 的
+  `sig_send_pgrp()`（要动进程表）都仍在 BKL 内，语义不变。
+- **`write` 端没动，理由要写清楚**：控制台输出改的是 `pccon.c` 里的
+  `crt_row/crt_col` 和 `klog_len`，这两个量**今天就没有锁**（`printf` 可以从
+  中断上下文进来，本来就不持 BKL，所以"syscall 写 vs 内核 printf"的竞争
+  在本次改动前就存在）。要真正把写端也摘出去，得给 `pccnputc()` 本身加锁；
+  而 `panic()` 会调 `printf()`，**panic 撞上一把别人持有的控制台锁就会
+  连一行 panic 信息都打不出来**。所以这一步先不动写端：写循环的工作量是
+  有界的（不等待外部事件），不像读端那样会无限期占着 BKL。要做得下一步
+  得先设计"panic 时无锁"的旁路。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**（58s），
+`test_tty`/`test_sig` 单独 PASS（回显与 `^C` 都正常）；
+8 核 3 GB 基线全过，**0 TRAP / triple fault / STACK OVERFLOW / address space
+busy**，`exit 0`。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -952,8 +978,12 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    安全，`proc_sched()` 里的再次释放退化为空操作），唤醒契约
    （`uk_regs`/`uk_pipeidx`/`uk_piperw`/`uk_pipeat`/`uk_pipelen`/`rpid`）
    在锁内、阻塞前一次性发布。
-6. **console/tty read/write**：需要先有 tty 锁，`tty_tb.c` 里的环形缓冲目前
-   全靠 BKL。
+6. **console/tty read/write** ✅ 读端已完成（§6.2.15）：`console_read()` 只在
+   轮询 `cngetc()` 的那一段放 BKL——原来停在提示符的 shell 会持着 BKL 无限期
+   轮询，把其它核全饿死。键盘环形缓冲**不需要新锁**（`pccngetc()` 用
+   `spltty()` 屏蔽 IRQ）。写端仍未摘：`crt_row/crt_col`/`klog_len` 本来就没有
+   锁，且 `panic()` 也走 `printf()`，给 `pccnputc()` 加锁必须先做"panic 无锁
+   旁路"。
 7. **`open` / `close`**：最后做。要连带 **namei 的路径级锁**（现在
    `vfs_namei()` 整条路径不持锁、靠 BKL）与 vnode 生命周期（`vn_put` →
    `dir_cache_keep` / `vn_free`）。`close` 还要处理 fd 与 pipe/vnode 的

@@ -5732,9 +5732,31 @@ console_read(char *buf, unsigned len)
 	int c;
 
 	while (i < len - 1) {
-		c = cngetc();
-		if (c == 0)
-			continue;
+		/*
+		 * §7.2.1 item 6: poll for a character with the BKL released.
+		 *
+		 * This loop can spin for as long as the user takes to type,
+		 * and it used to spin holding the BKL -- on SMP a shell
+		 * waiting at a prompt starved every other CPU for the whole
+		 * idle period.  The keyboard ring needs no new lock to make
+		 * this safe: pccngetc() already runs under spltty(), which
+		 * masks the keyboard IRQ for the duration of the sgetc(), so
+		 * the ring's head/tail can never be observed half updated.
+		 * Everything that does need the BKL -- the line-discipline
+		 * buffer, the echo and the ^C/^Z/^\ signal delivery to the
+		 * foreground pgrp -- happens after smp_bkl_enter() below.
+		 * 中文：§7.2.1 第 6 条：等按键时放掉 BKL。这个循环可能停到用户敲键
+		 * 为止，原来一直持着 BKL，SMP 下一个停在提示符的空闲 shell 会把其它
+		 * 核全饿死。键盘环形缓冲不需要新锁：pccngetc() 本来就在 spltty() 里
+		 * 做 sgetc()，取字符期间键盘 IRQ 被屏蔽，head/tail 不会被看到半更新。
+		 * 真正需要 BKL 的部分（行规程缓冲、回显、向台前进程组发 ^C/^Z/^\）
+		 * 都在 smp_bkl_enter() 之后。
+		 */
+		smp_bkl_drop();
+		do {
+			c = cngetc();
+		} while (c == 0);
+		smp_bkl_enter();
 		if (c == '\r' || c == '\n') {
 			cnputc('\n');
 			buf[i++] = '\n';
