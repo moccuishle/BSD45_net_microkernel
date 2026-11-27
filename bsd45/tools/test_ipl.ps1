@@ -35,7 +35,7 @@ $log = (& $script -Iso $Iso -Keys @(
     "ipl",
     "ipltest",
     "ipltrace",
-    "ipl") -WaitFor "ipltest: PASS" -TimeoutSec 60) -join "`n"
+    "ipl") -WaitFor "ipltest: PASS" -TimeoutSec 20) -join "`n"
 
 Check "levels"       $log @("ipl: 16 levels", "clock: 100 Hz", "IRQ0 -> IPL 5")
 Check "vector map"   $log @("ipltest: vector map ok")

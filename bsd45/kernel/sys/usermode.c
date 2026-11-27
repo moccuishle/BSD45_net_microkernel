@@ -6889,6 +6889,9 @@ bsd45_syscall(struct sysregs *r)
 		break;
 	}
 	case 188: {			/* fstat(fd, sb) */
+		struct vnode *fvp;
+		unsigned ftype, fnode, flen;
+
 		if (!user_ok(r->ecx, STAT_SIZE)) {
 			r->eax = (unsigned)-EFAULT;
 			break;
@@ -6898,33 +6901,51 @@ bsd45_syscall(struct sysregs *r)
 			r->eax = 0;
 			break;
 		}
+		/*
+		 * §7.2.1 step 2: fstat is read-only metadata.  Pin the vnode
+		 * under fd_lock and run getattr() with the BKL dropped (it may
+		 * touch the ISO / buffer cache).  The stat buffer is written
+		 * after the BKL is re-acquired, never while holding fd_lock.
+		 * Non-vnode fd types only read kernel-side fields, so they stay
+		 * under the BKL (tmpfs has no node lock yet).
+		 */
+		/* 中文：§7.2.1 第 2 条：fstat 只读元数据。锁内固定 vnode，getattr 在放掉 BKL 后调用；stat 缓冲在重新进入 BKL 后才写，且不在持 fd_lock 时写用户内存。非 vnode 类型仍留在 BKL 内。 */
+		spin_lock(&fd_lock);
 		if (r->ebx >= NFD || !cur->uk_fds[r->ebx].used) {
+			spin_unlock(&fd_lock);
 			r->eax = (unsigned)-EBADF;
 			break;
 		}
-		if (cur->uk_fds[r->ebx].vp != 0) {
+		fvp = cur->uk_fds[r->ebx].vp;
+		if (fvp != 0)
+			vn_ref(fvp);
+		spin_unlock(&fd_lock);
+
+		if (fvp != 0) {
 			unsigned mode = 0, size = 0;
 
-			cur->uk_fds[r->ebx].vp->ops->getattr(
-			    cur->uk_fds[r->ebx].vp, &mode, &size);
+			smp_bkl_drop();
+			fvp->ops->getattr(fvp, &mode, &size);
+			smp_bkl_enter();
 			fill_stat(mode, size, (unsigned *)r->ecx);
+			vn_put(fvp);
 			r->eax = 0;
 			break;
 		}
-		if (cur->uk_fds[r->ebx].type == FD_TMPFILE) {
-			fill_stat(0100644,
-			    tmpfs[cur->uk_fds[r->ebx].node].size,
-			    (unsigned *)r->ecx);
-			r->eax = 0;
-			break;
-		}
-		if (cur->uk_fds[r->ebx].type == FD_TMPDIR) {
+
+		spin_lock(&fd_lock);
+		ftype = cur->uk_fds[r->ebx].type;
+		fnode = cur->uk_fds[r->ebx].node;
+		flen = cur->uk_fds[r->ebx].len;
+		spin_unlock(&fd_lock);
+
+		if (ftype == FD_TMPFILE)
+			fill_stat(0100644, tmpfs[fnode].size, (unsigned *)r->ecx);
+		else if (ftype == FD_TMPDIR)
 			fill_stat(0040755, 4096, (unsigned *)r->ecx);
-			r->eax = 0;
-			break;
-		}
-		fill_stat(cur->uk_fds[r->ebx].type == FD_DIR ? 0040755 : 0100755,
-		    cur->uk_fds[r->ebx].len, (unsigned *)r->ecx);
+		else
+			fill_stat(ftype == FD_DIR ? 0040755 : 0100755, flen,
+			    (unsigned *)r->ecx);
 		r->eax = 0;
 		break;
 	}
@@ -7036,25 +7057,55 @@ bsd45_syscall(struct sysregs *r)
 	}
 	case 199: {			/* lseek(fd, off, whence) */
 		unsigned fd = r->ebx, off = r->ecx, wh = r->edx;
+		struct vnode *lvp;
 
+		/*
+		 * §7.2.1 step 1: lseek is a pure fd-table operation, so it
+		 * leaves the BKL.  Under fd_lock we validate the descriptor
+		 * and pin the vnode; getattr() (only needed for SEEK_END) is
+		 * then called with the BKL dropped because it goes to the
+		 * backend (ISO / buffer cache).  The offset is committed back
+		 * only if the descriptor still names the same vnode.
+		 * Non-vnode fd types (tmpfs/dir/dev/...) only read kernel-side
+		 * fields and stay under the BKL: tmpfs has no node lock yet
+		 * (§7.2.1 item 4), and the BKL still serialises those paths.
+		 */
+		/* 中文：§7.2.1 第 1 条摘 BKL 的路径：lseek 纯 fd 表操作。锁内校验 fd 并固定 vnode，getattr（仅 SEEK_END 需要）在放掉 BKL 后调用（它会走 ISO/缓冲缓存）；只有 fd 仍指向同一 vnode 才回写偏移。tmpfs/目录/设备等非 vnode 类型只读内核字段，仍留在 BKL 内（tmpfs 尚无节点锁）。 */
+		spin_lock(&fd_lock);
 		if (fd >= NFD || !cur->uk_fds[fd].used) {
+			spin_unlock(&fd_lock);
 			r->eax = (unsigned)-EBADF;
 			break;
 		}
-		if (cur->uk_fds[fd].vp != 0) {
+		lvp = cur->uk_fds[fd].vp;
+		if (lvp != 0)
+			vn_ref(lvp);
+		spin_unlock(&fd_lock);
+
+		if (lvp != 0) {
 			unsigned mode = 0, size = 0;
 
-			cur->uk_fds[fd].vp->ops->getattr(cur->uk_fds[fd].vp,
-			    &mode, &size);
-			if (wh == 0)
-				cur->uk_fds[fd].off = off;
-			else if (wh == 1)
-				cur->uk_fds[fd].off += off;
-			else
-				cur->uk_fds[fd].off = size;
-			r->eax = cur->uk_fds[fd].off;
+			smp_bkl_drop();
+			lvp->ops->getattr(lvp, &mode, &size);
+			smp_bkl_enter();
+
+			spin_lock(&fd_lock);
+			if (cur->uk_fds[fd].vp == lvp) {
+				if (wh == 0)
+					cur->uk_fds[fd].off = off;
+				else if (wh == 1)
+					cur->uk_fds[fd].off += off;
+				else
+					cur->uk_fds[fd].off = size;
+				r->eax = cur->uk_fds[fd].off;
+			} else
+				r->eax = (unsigned)-EBADF;
+			spin_unlock(&fd_lock);
+			vn_put(lvp);
 			break;
 		}
+
+		spin_lock(&fd_lock);
 		if (cur->uk_fds[fd].type == FD_TMPFILE) {
 			if (wh == 0)
 				cur->uk_fds[fd].off = off;
@@ -7063,15 +7114,11 @@ bsd45_syscall(struct sysregs *r)
 			else
 				cur->uk_fds[fd].off = tmpfs[cur->uk_fds[fd].node].size;
 			r->eax = cur->uk_fds[fd].off;
-			break;
-		}
-		if (cur->uk_fds[fd].type == FD_TMPDIR) {
+		} else if (cur->uk_fds[fd].type == FD_TMPDIR) {
 			cur->uk_fds[fd].dpos = (wh == 1) ? cur->uk_fds[fd].dpos + off
 			    : 0;
 			r->eax = cur->uk_fds[fd].dpos;
-			break;
-		}
-		if (cur->uk_fds[fd].type == FD_DIR) {
+		} else if (cur->uk_fds[fd].type == FD_DIR) {
 			if (wh == 0)
 				cur->uk_fds[fd].dpos = off;
 			else if (wh == 1)
@@ -7079,15 +7126,16 @@ bsd45_syscall(struct sysregs *r)
 			else
 				cur->uk_fds[fd].dpos = cur->uk_fds[fd].dsize;
 			r->eax = cur->uk_fds[fd].dpos;
-			break;
+		} else {
+			if (wh == 0)
+				cur->uk_fds[fd].off = off;
+			else if (wh == 1)
+				cur->uk_fds[fd].off += off;
+			else
+				cur->uk_fds[fd].off = cur->uk_fds[fd].len;
+			r->eax = cur->uk_fds[fd].off;
 		}
-		if (wh == 0)
-			cur->uk_fds[fd].off = off;
-		else if (wh == 1)
-			cur->uk_fds[fd].off += off;
-		else
-			cur->uk_fds[fd].off = cur->uk_fds[fd].len;
-		r->eax = cur->uk_fds[fd].off;
+		spin_unlock(&fd_lock);
 		break;
 	}
 	case 89:			/* getdtablesize */

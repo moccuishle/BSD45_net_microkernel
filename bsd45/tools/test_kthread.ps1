@@ -34,7 +34,7 @@ $log = (& $script -Iso $Iso -Keys @(
     "softirq",
     "kthreadtest",
     "softirqtest",
-    "kthread") -WaitFor "softirqtest: PASS" -TimeoutSec 60) -join "`n"
+    "kthread") -WaitFor "softirqtest: PASS" -TimeoutSec 20) -join "`n"
 
 Check "stacks"      $log @("thread slots at fc000000", "16 KB stacks")
 Check "soft thread" $log @("kthread: spawn softirq")

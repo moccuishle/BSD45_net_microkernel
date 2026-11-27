@@ -8,9 +8,9 @@ param(
     [string]$WaitFor = "",
     [int]$TimeoutSec = 40,
     [int]$BootTimeoutSec = 25,
-    [int]$SerialPort = 5555,
-    [int]$MonitorPort = 4444,
-    [int]$SettleMs = 300,
+    [int]$SerialPort = 0,
+    [int]$MonitorPort = 0,
+    [int]$SettleMs = 200,
     [int]$MemMB = 128
 )
 
@@ -24,7 +24,23 @@ if (!$Iso) { $Iso = Join-Path $ws "out\BSD45-ELF-x86.iso" }
 $qemu = Get-Qemu
 if (!$qemu) { throw "qemu-system-i386.exe not found (set QEMU env var)" }
 
-$log = Join-Path $ws "build\qemu-serial.log"
+# Allocate free TCP ports when the caller did not pin them, so several test
+# scripts can run concurrently without colliding on the old fixed 5555/4444.
+function Get-FreeTcpPort {
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $l.Start()
+    $port = ([System.Net.IPEndPoint]$l.LocalEndpoint).Port
+    $l.Stop()
+    return $port
+}
+if ($SerialPort -eq 0) { $SerialPort = Get-FreeTcpPort }
+if ($MonitorPort -eq 0) {
+    $MonitorPort = Get-FreeTcpPort
+    while ($MonitorPort -eq $SerialPort) { $MonitorPort = Get-FreeTcpPort }
+}
+
+# Per-process log so concurrent runs do not clobber each other.
+$log = Join-Path $ws ("build\qemu-serial-" + $PID + ".log")
 Remove-Item $log -Force -ErrorAction SilentlyContinue
 
 $argList = @(
@@ -34,7 +50,7 @@ $argList = @(
     "-monitor", "tcp:127.0.0.1:$MonitorPort,server=on,nowait"
 )
 $p = Start-Process -FilePath $qemu -ArgumentList $argList -PassThru -WindowStyle Hidden
-Start-Sleep -Milliseconds 800
+Start-Sleep -Milliseconds 400
 
 $client = New-Object System.Net.Sockets.TcpClient
 $deadline = (Get-Date).AddSeconds(10)
@@ -85,8 +101,8 @@ try {
             Write-Host "serial closed while sending: $k"
             break
         }
-        Pump 200
-        Start-Sleep -Milliseconds 500
+        Pump 120
+        Start-Sleep -Milliseconds 300
     }
     if ($WaitFor) { [void](Wait-Text $WaitFor ($TimeoutSec * 1000)) }
     else { Pump 3000 }

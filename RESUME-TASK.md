@@ -642,6 +642,56 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 
 
 
+### 6.2.10 P2 第五步：lseek + fstat 摘 BKL（2026-11-28）
+
+按 `§7.2.1` 的顺序做完了前两条（`lseek`、`fstat`），**都没有引入新锁**——
+它们触及的状态全部已有归属：fd 表 = `fd_lock`、vnode 池 = `vfs_lock`。
+
+- **共同模板**（与 §6.2.9 的 `read` 一致）：`fd_lock` 内校验 fd、`vn_ref()`
+  固定 vnode、快照偏移/类型 → 放锁 → `smp_bkl_drop()` → 调后端 →
+  `smp_bkl_enter()` → 回 `fd_lock` 内**确认 fd 仍指向同一 vnode** 才提交。
+- **`lseek`（syscall 199）**：唯一碰后端的是 `getattr()`（`SEEK_END` 取文件
+  大小），它在放掉 BKL 后执行；`SEEK_SET/CUR` 只改 `off`。fd 已关闭或被复用
+  时返回 `EBADF`。
+- **`fstat`（syscall 188）**：`getattr()` 同样在 BKL 外调用；`fill_stat()`
+  写用户内存在**重新进入 BKL 之后**做，且**不持 `fd_lock` 写用户内存**（避免
+  在自旋锁里触发缺页）。
+- **非 vnode 类型仍留在 BKL 内**：`FD_TMPFILE` 读 `tmpfs[].size`，
+  `FD_TMPDIR`/`FD_DIR` 改 `dpos`，设备类读 `len`。原因是 tmpfs 还没有节点锁
+  （§7.2.1 第 4 条），此时摘 BKL 会把 `size` 与 `data` 的两步分配暴露成
+  race；这两条路径下 fd 表在 BKL 内稳定，锁只做快照。
+- **锁序**：`BKL -> fd_lock -> vfs_lock`；`vn_put()` 在 `fd_lock` 外调用。
+  与 `read` 完全一致，没有新增反向路径。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**（`test_subsys`/
+`test_ipl`，与基线逐套一致，无回归）；8 核 3 GB 基线 `smpon`+`smpuser`+
+`pthread`+`pthmain`+`pthpre`+`aiotest` 全过，**0 TRAP / triple fault /
+STACK OVERFLOW / address space busy**，`ps` 正常，`exit 0` 干净退出。
+
+**仍未摘**：`write`、`open`/`close`、`fork`/`exec`、信号、pipe、console 以及
+`read` 的非文件 fd 类型；下一步从 §7.2.1 第 3 条（`/dev` 伪文件，需先加
+`devbuf_lock`）起。
+
+### 6.2.11 测试提速：并行驱动 + 修掉两个白等 60s 的超时（2026-11-28）
+
+Windows 上全套验收从 **5m33s → 59s**，三条做法都不改任何判定语义：
+
+- **`test_kthread` / `test_ipl` 的 `-TimeoutSec` 60 → 20**：两者的 `-WaitFor`
+  永远匹配不上——`kthread` 等 `"softirqtest: PASS"`，实际输出却是
+  `"softirqtest: count 1 PASS"`；`ipl` 等 `"ipltest: PASS"`，但 `ipl`/
+  `ipltest` 命令已在 `36a84a1` 删除。于是每套都白等满 60s（67s/68s →
+  25s/26s）。**没有改 `-WaitFor` 本身**：`kthread` 第 5 条命令
+  （`kthread: switches`）的输出在 WaitFor 之后，改字符串会漏采。
+- **`run_qemu_test.ps1` 固定等待收紧**：每命令间隔 500→300 ms、`Pump`
+  200→120 ms、`SettleMs` 300→200 ms、启动连接前 800→400 ms，全部 ≤1 s。
+- **并行驱动**（`parallel=4`，16 核实测）：默认端口 5555/4444 改为用
+  `TcpListener(0)` **自动分配空闲端口**，串口日志改为
+  `build\qemu-serial-<PID>.log`，多套测试可同时启动、互不冲突。26 套 4 路
+  并发的墙钟 **59 s**。
+
+判读：并行后单套时间略增（争 CPU），整体墙钟降约 75%；结果与串行基线逐套
+一致（24 PASS + 2 已知失效）。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -773,15 +823,17 @@ vnode"的 bug。按这两条同时成立，锁序只能是 `vfs_lock -> nc_lock`
 #### 7.2.1 下一步（可直接动手，2026-11-26 交接）
 
 已经做完的：`vfs_lock`（vnode 池）、`pipe_lock`、`pc_lock`（页缓存）、
-`bio_lock`（缓冲缓存）、`nc_lock`（名字缓存）、`fd_lock`，以及**普通文件
-`read(2)` 摘掉 BKL**（§6.2.9）。下面按"风险从低到高、每次只动一条路径"排好序，
-**每做完一条都要跑 §0.4 的全套 27 套 + 8 核基线，再进下一条**。
+`bio_lock`（缓冲缓存）、`nc_lock`（名字缓存）、`fd_lock`；系统调用里
+**普通文件 `read(2)`**（§6.2.9）、**`lseek` 与 `fstat`**（§6.2.10）已摘掉
+BKL。下面按"风险从低到高、每次只动一条路径"排好序，
+**每做完一条都要跑 §0.4 的全套 + 8 核基线，再进下一条**。测试已改为
+并行驱动（§6.2.11，全套 59 s），一轮验证的成本已很低。
 
-1. **`lseek`（最小一步，纯 fd 表）**：`usermode.c` 里 `lseek` 只改
-   `uk_fds[fd].off`，套上 `fd_lock` 后即可 `smp_bkl_drop()`。做完这条就有了
-   "两条路径离开 BKL"的模板。
-2. **`fstat` / `stat`**：只读 vnode 的 `getattr`，vnode 已由 `vfs_lock` 保护；
-   注意 `stat` 还走 namei（先别摘，只摘 `fstat`）。
+1. **`lseek`（最小一步，纯 fd 表）** ✅ 已完成（§6.2.10）：`usermode.c` 里
+   `lseek` 只改 `uk_fds[fd].off`，套上 `fd_lock` 后 `smp_bkl_drop()`；
+   已建立"两条路径离开 BKL"的模板。
+2. **`fstat` / `stat`** ✅ `fstat` 已完成（§6.2.10）：只读 vnode 的 `getattr`，
+   vnode 由 `vfs_lock` 保护；`stat` 仍走 namei，**尚未摘**。
 3. **`/dev` 伪文件 read**：`FD_ZERO`/`FD_NULL`/`FD_VMSTAT`/`FD_MOUNTS`/
    `FD_PS`。它们的输出落在文件作用域静态缓冲（`ps_snap_buf`、`mbuf`、
    `vbuf`），**必须先加一把 `devbuf_lock`**，否则两个进程同时读会互相踩。
