@@ -719,6 +719,47 @@ Windows 上全套验收从 **5m33s → 59s**，三条做法都不改任何判定
 `pthread`/`pthmain`/`pthpre`/`aiotest` 全过，**0 TRAP / triple fault /
 STACK OVERFLOW / address space busy**，`ps` 正常，`exit 0` 干净退出。
 
+### 6.2.13 P2 第七步：tmpfs 节点锁 + write(2) 摘 BKL（2026-11-28）
+
+按 §7.2.1 第 4 条。先说一个**代码盘点结论**：文档里写的 "
+`FD_TMPFILE` 直接读写 `tmpfs[].data`"指的是 `usermode.c` 里那套遗留路径，而
+`fd_alloc_tmpfile()`/`tmpfs_create()`/`tmpfs_remove()` **全都没有调用者**
+（死代码，真正的 `/tmp` 早就是 `kernel/fs/tmpfs.c` 的 VFS 后端）。所以这一条
+实际修的是 VFS 后端：
+
+- **发现的真实竞争**（比文档描述更严重）：`read(2)` 走通用 vnode 分支，
+  **§6.2.9 之后 tmpfs 的读早就在 BKL 外执行了**，而 `write`/`truncate`/`remove`
+  还在 BKL 内。也就是说：`readraw()` 在填页时，另一个核可以同时 `write()` 增长
+  `n->size`、`truncate()` 把数据页还回页池、`remove()` 让槽位被复用——**这是
+  一个已经在线上的缺锁 bug**，不是"还没摘所以没问题"。
+- **`tmpfs_lock`（`kernel/fs/tmpfs.c`）**：一把锁覆盖全部节点字段
+  （`used/isdir/name/data/pa/size`）。`tmpfs_getdata/putdata/find/create_node`
+  统一改为 `_locked` 内部版本，调用者持锁；`getattr`（快照 size）、
+  `readraw`（填页）、`readdir`、`lookup`、`create`、`remove`、`mkdir`、
+  `rmdir`、`truncate`、`rename` 全部进锁。
+- **"分配页 + 改 size"必须同一临界区**：文档提醒的两步，现在整段在
+  `tmpfs_write_op()` 的锁内完成；`pagecache_purge_vp()` 放在解锁之后，
+  否则会引入 `tmpfs_lock -> pc_lock`。
+- **锁序**：`tmpfs_lock -> page_lock`（`getdata/putdata` → `vfs_page_alloc/free`）。
+  没有 `tmpfs_lock -> pc_lock`（purge 在锁外）；也没有 `pc_lock -> tmpfs_lock`
+  ——`pagecache_get()` 是**先放 `pc_lock` 再回调 `ops->readraw()`**
+  （`pagecache.c:332`），所以 `readraw` 里取节点锁是最内层，不反转
+  `vfs_lock -> pc_lock`。`lookup`/`create` 里 `vn_alloc()`（取 `vfs_lock`）
+  放在锁外，只是把下标拷出来，避免多一种嵌套。
+- **`write(2)` 摘 BKL**：与 `read(2)`（§6.2.9）同一模板——`fd_lock` 内校验 fd、
+  `vn_ref()` 固定 vnode、取偏移快照；放 `fd_lock` 后 `smp_bkl_drop()` 执行
+  `vfs_write_sync()`，回来再确认 fd 仍指向同一 vnode 才回写偏移。
+  **只放行 tmpfs**（新增 `tmpfs_is_vnode()`）：JLFS 写仍走 ATA + 日志，
+  在它自己的锁审计完成前继续由 BKL 串行。
+
+**已知遗留**（不影响内存安全，先记录）：vnode 用"节点下标"标识，`unlink` 后
+槽位被新文件复用，仍持有旧 fd 的进程会读到新文件的内容。这在加锁前就存在，
+彻底修需要节点引用计数 + `zombie` 标记，留到 open/close 那一条一起做。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**（59s）；
+8 核 3 GB 基线 `pthread`/`pthmain`/`pthpre`/`aiotest` 全过，
+**0 TRAP / triple fault / STACK OVERFLOW / address space busy**，`exit 0`。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -865,9 +906,12 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    `FD_MOUNTS`/`FD_PS`，新增 `devbuf_lock` 保护文件级静态缓冲（`ps_snap_buf`、
    `mbuf`、`vbuf`）。**未摘 BKL**：跨 `smp_bkl_enter()` 持 `devbuf_lock` 会
    反转锁序造成 S422 型死锁；要摘需先把渲染改成每次调用自己的缓冲。
-4. **tmpfs 文件 read/write**：`FD_TMPFILE` 直接读写 `tmpfs[].data`，要先给
-   tmpfs 节点加锁（或在 `pagecache_purge_vp` 之外引入节点锁），别忘了
-   `n->size` 与 `data` 的分配是分开的两步。
+4. **tmpfs 文件 read/write** ✅ 已完成（§6.2.13）：真正的 `/tmp` 后端是
+   `kernel/fs/tmpfs.c`（`usermode.c` 的 `FD_TMPFILE` 是无调用者的死代码）。
+   新增 `tmpfs_lock` 覆盖全部节点字段，"分配数据页 + 改 `n->size`"同一临界区，
+   `pagecache_purge_vp()` 移到锁外；`write(2)` 已按 `read(2)` 模板摘 BKL
+   （只放行 tmpfs，JLFS 仍由 BKL 串行）。顺带修掉一个已在线上的缺锁 bug：
+   `readraw` 早就在 BKL 外跑，却没有任何节点锁。
 5. **pipe read/write**：`pipe_lock` 已在，但阻塞路径要在 `kthread_block_tcb()`
    之前把 BKL 也放掉（现在只在 `proc_sched()` 前放），并且
    `uk_pipeidx/uk_piperw/uk_pipeat/uk_pipelen` 的写入顺序要与唤醒方对齐。

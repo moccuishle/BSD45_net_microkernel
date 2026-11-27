@@ -139,6 +139,7 @@ void	vn_ref_locked(struct vnode *vp);
 void	tmpfs_init(void);
 struct vnode *tmpfs_root(void);
 int	tmpfs_is_root(struct vnode *vp);
+int	tmpfs_is_vnode(struct vnode *vp);
 
 /*
  * Root filesystem source (S-install): the ISO live CD mounts the ISO9660

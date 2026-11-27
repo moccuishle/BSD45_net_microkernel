@@ -11,6 +11,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/errno.h>
+#include <sys/smp.h>
 
 #ifndef PAGE_SIZE
 #define	PAGE_SIZE	4096
@@ -49,14 +50,42 @@ static struct tmpfs_node tmpfs_nodes[TMPFS_MAXNODES];
 static struct vnode tmpfs_rootv;
 
 /*
+ * §7.2.1 item 4: the tmpfs node lock.
+ *
+ * Until now every tmpfs field was serialised by the BKL alone.  read(2) on a
+ * tmpfs vnode has *already* been running outside the BKL since §6.2.9 (it
+ * goes through the generic vnode branch of read(2) -> vfs_read_sync()), so
+ * the missing lock was a live race: a readraw() filling a page could run
+ * concurrently with a write() growing n->size, with truncate() handing the
+ * data page back to the pool, or with remove() reusing the slot.  This lock
+ * closes that window and is the precondition for dropping the BKL on the
+ * write side too.
+ *
+ * Scope: every node field (used/isdir/name/data/pa/size) and the lazily
+ * allocated data page.  The page allocation and the size update in
+ * tmpfs_write_op() must stay inside one critical section -- they are the
+ * "two separate steps" the design doc warns about.
+ *
+ * Order: tmpfs_lock -> page_lock (tmpfs_getdata/putdata -> vfs_page_alloc/
+ * free) and tmpfs_lock -> pc_lock is avoided by calling pagecache_purge_vp()
+ * after the unlock.  Nothing takes tmpfs_lock while holding pc_lock:
+ * pagecache_get() drops pc_lock before invoking ops->readraw().
+ * 中文：tmpfs 节点锁。此前 tmpfs 全靠 BKL；但 §6.2.9 之后 tmpfs 的 read(2) 已走通用
+ * vnode 分支在 BKL 外执行，与 write/truncate/remove 存在真实竞争。本锁覆盖全部节点
+ * 字段（含惰性分配的数据页），且 write 里"分配页 + 改 size"必须同一临界区。锁序：
+ * tmpfs_lock -> page_lock；purge 放到解锁之后，避免 tmpfs_lock -> pc_lock。
+ */
+static struct spinlock tmpfs_lock;
+
+/*
  * tmpfs data pages are allocated lazily on the first write and handed back
  * by truncate/remove/rmdir, so "echo x > /tmp/f" in a loop reuses one page
  * instead of eating the whole pool.
  */
-/* EN: Returns the node data pointer, allocating a page via vfs_page_alloc() mapped at TMPFS_VA + index * PAGE_SIZE and zeroed when create is set; 0 when create is clear. */
-/* 中文：返回节点的数据指针；create 置位且尚未分配时用 vfs_page_alloc() 取一页，映射到 TMPFS_VA + (n - tmpfs_nodes) * PAGE_SIZE 并清零 TMPFS_DATASZ 字节；create 为 0 时返回 0。 */
+/* EN: Returns the node data pointer, allocating a page via vfs_page_alloc() mapped at TMPFS_VA + index * PAGE_SIZE and zeroed when create is set; 0 when create is clear.  Caller holds tmpfs_lock. */
+/* 中文：返回节点的数据指针；create 置位且尚未分配时用 vfs_page_alloc() 取一页，映射到 TMPFS_VA + (n - tmpfs_nodes) * PAGE_SIZE 并清零 TMPFS_DATASZ 字节；create 为 0 时返回 0。调用者须持有 tmpfs_lock。 */
 static unsigned char *
-tmpfs_getdata(struct tmpfs_node *n, int create)
+tmpfs_getdata_locked(struct tmpfs_node *n, int create)
 {
 	int i = n - tmpfs_nodes;
 
@@ -72,10 +101,10 @@ tmpfs_getdata(struct tmpfs_node *n, int create)
 	return (n->data);
 }
 
-/* EN: Frees the node's data page by unmapping the kernel window with vfs_page_unmap() before vfs_page_free(), then clears data, pa and size; no-op when nothing is allocated. */
-/* 中文：先用 vfs_page_unmap() 解除内核窗口映射，再经 vfs_page_free() 归还物理页，随后清空 data、pa 与 size；未分配时直接返回。 */
+/* EN: Frees the node's data page by unmapping the kernel window with vfs_page_unmap() before vfs_page_free(), then clears data, pa and size; no-op when nothing is allocated.  Caller holds tmpfs_lock. */
+/* 中文：先用 vfs_page_unmap() 解除内核窗口映射，再经 vfs_page_free() 归还物理页，随后清空 data、pa 与 size；未分配时直接返回。调用者须持有 tmpfs_lock。 */
 static void
-tmpfs_putdata(struct tmpfs_node *n)
+tmpfs_putdata_locked(struct tmpfs_node *n)
 {
 
 	if (n->data == 0)
@@ -103,6 +132,7 @@ tmpfs_init(void)
 	tmpfs_rootv.type = VDIR;
 	tmpfs_rootv.ops = &tmpfs_vnodeops;
 	tmpfs_rootv.node = -1;
+	spin_init(&tmpfs_lock);
 }
 
 /* EN: Returns the address of the single static tmpfs root vnode, tmpfs_rootv; no lock is taken and the caller gets no extra reference. */
@@ -125,10 +155,10 @@ tmpfs_is_root(struct vnode *vp)
 
 /* ---------------------------------------------------------------- nodes */
 
-/* EN: Linear-searches all TMPFS_MAXNODES slots for a used node whose name strcmp-equals name, returning that node pointer or 0 when absent. */
-/* 中文：在全部 TMPFS_MAXNODES 个槽中线性查找 used 且 name 经 strcmp 相等的节点，返回该节点指针，不存在时返回 0。 */
+/* EN: Linear-searches all TMPFS_MAXNODES slots for a used node whose name strcmp-equals name, returning that node pointer or 0 when absent.  Caller holds tmpfs_lock. */
+/* 中文：在全部 TMPFS_MAXNODES 个槽中线性查找 used 且 name 经 strcmp 相等的节点，返回该节点指针，不存在时返回 0。调用者须持有 tmpfs_lock。 */
 static struct tmpfs_node *
-tmpfs_find(const char *name)
+tmpfs_find_locked(const char *name)
 {
 	int i;
 
@@ -139,10 +169,10 @@ tmpfs_find(const char *name)
 	return (0);
 }
 
-/* EN: Rejects empty/too-long names; reuses an existing name only if isdir matches, else zeroes the first free slot, marks used/isdir, copies name (page on first write); 0 if full. */
-/* 中文：名字为空或 >=TMPFS_NAMELEN 时失败；已有同名节点仅在 isdir 相符时复用，否则占首个空闲槽、清零并置 used/isdir、拷入名字（数据页留到首次写才分配），无空槽返回 0。 */
+/* EN: Rejects empty/too-long names; reuses an existing name only if isdir matches, else zeroes the first free slot, marks used/isdir, copies name (page on first write); 0 if full.  Caller holds tmpfs_lock. */
+/* 中文：名字为空或 >=TMPFS_NAMELEN 时失败；已有同名节点仅在 isdir 相符时复用，否则占首个空闲槽、清零并置 used/isdir、拷入名字（数据页留到首次写才分配），无空槽返回 0。调用者须持有 tmpfs_lock。 */
 static struct tmpfs_node *
-tmpfs_create_node(const char *name, int isdir)
+tmpfs_create_node_locked(const char *name, int isdir)
 {
 	struct tmpfs_node *n;
 	int i, len;
@@ -150,7 +180,7 @@ tmpfs_create_node(const char *name, int isdir)
 	len = strlen(name);
 	if (len == 0 || len >= TMPFS_NAMELEN)
 		return (0);
-	if ((n = tmpfs_find(name)) != 0)
+	if ((n = tmpfs_find_locked(name)) != 0)
 		return (n->isdir == isdir ? n : 0);
 	for (i = 0; i < TMPFS_MAXNODES; i++) {
 		if (tmpfs_nodes[i].used)
@@ -175,18 +205,31 @@ tmpfs_lookup_op(struct vnode *dv, const char *name, struct vnode **vpp)
 {
 	struct tmpfs_node *n;
 	struct vnode *vp;
+	int idx, isdir;
 
 	if (dv != &tmpfs_rootv)
 		return (-ENOENT);
-	n = tmpfs_find(name);
-	if (n == 0)
+	/*
+	 * Table scan under tmpfs_lock, vnode allocation outside it:
+	 * vn_alloc() takes vfs_lock, and there is no reason to nest the
+	 * two orders when a plain index copy is all we need.
+	 */
+	/* 中文：表扫描在 tmpfs_lock 内，vnode 分配放在锁外：vn_alloc() 会取 vfs_lock，没必要把两种锁序嵌套起来。 */
+	spin_lock(&tmpfs_lock);
+	n = tmpfs_find_locked(name);
+	if (n == 0) {
+		spin_unlock(&tmpfs_lock);
 		return (-ENOENT);
+	}
+	idx = n - tmpfs_nodes;
+	isdir = n->isdir;
+	spin_unlock(&tmpfs_lock);
 	vp = vn_alloc();
 	if (vp == 0)
 		return (-ENOMEM);
-	vp->type = n->isdir ? VDIR : VREG;
+	vp->type = isdir ? VDIR : VREG;
 	vp->ops = &tmpfs_vnodeops;
-	vp->node = n - tmpfs_nodes;
+	vp->node = idx;
 	*vpp = vp;
 	return (0);
 }
@@ -204,8 +247,15 @@ tmpfs_getattr_op(struct vnode *vp, unsigned *mode, unsigned *size)
 		return (0);
 	}
 	n = &tmpfs_nodes[vp->node];
+	/*
+	 * §7.2.1 item 4: size is exactly what a concurrent write() grows,
+	 * so the snapshot has to be taken under the node lock.
+	 * 中文：size 正是并发 write() 会增长的量，必须在节点锁内取值。
+	 */
+	spin_lock(&tmpfs_lock);
 	*mode = n->isdir ? 0040755 : 0100644;
 	*size = n->isdir ? 0 : n->size;
+	spin_unlock(&tmpfs_lock);
 	return (0);
 }
 
@@ -224,13 +274,29 @@ tmpfs_readraw_op(struct vnode *vp, unsigned off, void *buf, unsigned len)
 	if (vp->node < 0)
 		return (-EISDIR);
 	n = &tmpfs_nodes[vp->node];
-	if (n->isdir)
-		return (-EISDIR);
-	if (n->data == 0 || off >= n->size)
+	/*
+	 * Called by pagecache_get() with pc_lock *not* held (it drops the
+	 * lock before the callback), so this is a leaf: tmpfs_lock may be
+	 * taken here without inverting the documented vfs_lock -> pc_lock
+	 * order.  A truncate()/remove() racing with this fill would
+	 * otherwise hand the page back to the pool mid-bcopy.
+	 * 中文：pagecache_get() 调用本回调时并未持有 pc_lock（先放锁再回调），
+	 * 所以这里是最内层，取 tmpfs_lock 不会反转 vfs_lock -> pc_lock 的既有锁序；
+	 * 否则 truncate()/remove() 可能在 bcopy 中途把页还给页池。
+	 */
+	spin_lock(&tmpfs_lock);
+	if (!n->used || n->isdir) {
+		spin_unlock(&tmpfs_lock);
+		return (n->isdir ? -EISDIR : 0);
+	}
+	if (n->data == 0 || off >= n->size) {
+		spin_unlock(&tmpfs_lock);
 		return (0);
+	}
 	if (len > n->size - off)
 		len = n->size - off;
 	bcopy(n->data + off, buf, len);
+	spin_unlock(&tmpfs_lock);
 	return ((int)len);
 }
 
@@ -240,17 +306,21 @@ static int
 tmpfs_read_op(struct vnode *vp, unsigned off, void *buf, unsigned len)
 {
 	struct tmpfs_node *n;
+	int isdir;
 
 	if (vp->node < 0)
 		return (-EISDIR);
 	n = &tmpfs_nodes[vp->node];
-	if (n->isdir)
+	spin_lock(&tmpfs_lock);
+	isdir = (n->isdir || !n->used);
+	spin_unlock(&tmpfs_lock);
+	if (isdir)
 		return (-EISDIR);
 	return (pagecache_read(vp, off, buf, len));
 }
 
-/* EN: Dir -EISDIR, off >= TMPFS_DATASZ -ENOSPC; clips len, lazily allocs the 4096-byte page (fail -ENOSPC), copies, grows n->size, purges page cache, returns count. */
-/* 中文：目录返回 -EISDIR，off >= TMPFS_DATASZ 返回 -ENOSPC；把 len 截到页尾，经 tmpfs_getdata(n,1) 惰性分配 4096 字节页（失败返回 -ENOSPC），拷贝后增长 n->size，再 purge 该 vnode 的页缓存并返回字节数。 */
+/* EN: Dir -EISDIR, gone -ENOENT, off >= TMPFS_DATASZ -ENOSPC; clips len, lazily allocs the 4096-byte page (fail -ENOSPC), copies, grows n->size and purges the vnode page cache, all under tmpfs_lock except the purge; returns count. */
+/* 中文：目录返回 -EISDIR、节点已删除返回 -ENOENT、off >= TMPFS_DATASZ 返回 -ENOSPC；把 len 截到页尾，经 tmpfs_getdata_locked(n,1) 惰性分配 4096 字节页（失败返回 -ENOSPC），拷贝后增长 n->size，最后 purge 该 vnode 页缓存（purge 在锁外）并返回字节数。 */
 static int
 tmpfs_write_op(struct vnode *vp, unsigned off, const void *buf, unsigned len)
 {
@@ -259,17 +329,36 @@ tmpfs_write_op(struct vnode *vp, unsigned off, const void *buf, unsigned len)
 	if (vp->node < 0)
 		return (-EISDIR);
 	n = &tmpfs_nodes[vp->node];
-	if (n->isdir)
-		return (-EISDIR);
-	if (off >= TMPFS_DATASZ)
+	/*
+	 * Allocation of the data page and the n->size bump are two steps;
+	 * they must not be observable half done, so both stay inside the
+	 * node lock.  pagecache_purge_vp() runs after the unlock: holding
+	 * tmpfs_lock across it would add tmpfs_lock -> pc_lock to the order.
+	 * 中文：数据页分配与 n->size 增长是两个步骤，不能被观察到"完成一半"，
+	 * 因此整段都在节点锁内；pagecache_purge_vp() 放到解锁之后调用，
+	 * 否则会引入 tmpfs_lock -> pc_lock 的锁序。
+	 */
+	spin_lock(&tmpfs_lock);
+	if (!n->used || n->isdir) {
+		int err = n->used ? -EISDIR : -ENOENT;
+
+		spin_unlock(&tmpfs_lock);
+		return (err);
+	}
+	if (off >= TMPFS_DATASZ) {
+		spin_unlock(&tmpfs_lock);
 		return (-ENOSPC);
+	}
 	if (len > TMPFS_DATASZ - off)
 		len = TMPFS_DATASZ - off;
-	if (tmpfs_getdata(n, 1) == 0)
+	if (tmpfs_getdata_locked(n, 1) == 0) {
+		spin_unlock(&tmpfs_lock);
 		return (-ENOSPC);
+	}
 	bcopy(buf, n->data + off, len);
 	if (off + len > n->size)
 		n->size = off + len;
+	spin_unlock(&tmpfs_lock);
 	pagecache_purge_vp(vp);
 	return ((int)len);
 }
@@ -282,6 +371,7 @@ tmpfs_readdir_op(struct vnode *vp, unsigned *cookie, char *name, int *isdir)
 	unsigned i;
 
 	(void)vp;
+	spin_lock(&tmpfs_lock);
 	for (i = *cookie; i < TMPFS_MAXNODES; i++) {
 		if (!tmpfs_nodes[i].used)
 			continue;
@@ -289,23 +379,29 @@ tmpfs_readdir_op(struct vnode *vp, unsigned *cookie, char *name, int *isdir)
 		bcopy(tmpfs_nodes[i].name, name,
 		    strlen(tmpfs_nodes[i].name) + 1);
 		*isdir = tmpfs_nodes[i].isdir;
+		spin_unlock(&tmpfs_lock);
 		return (0);
 	}
 	*cookie = TMPFS_MAXNODES;
+	spin_unlock(&tmpfs_lock);
 	return (1);
 }
 
 /* EN: Regular file, tmpfs root only (else -ENOENT): node creation failure gives -ENOSPC, vn_alloc failure -ENOMEM, else type VREG + tmpfs_vnodeops + node index are set. */
-/* 中文：只在 tmpfs 根目录创建普通文件（否则 -ENOENT）：tmpfs_create_node(name,0) 返回 0 则得 -ENOSPC，vn_alloc 失败则 -ENOMEM；否则 vnode 置为 VREG、tmpfs_vnodeops 与节点下标。 */
+/* 中文：只在 tmpfs 根目录创建普通文件（否则 -ENOENT）：tmpfs_create_node_locked(name,0) 返回 0 则得 -ENOSPC，vn_alloc 失败则 -ENOMEM；否则 vnode 置为 VREG、tmpfs_vnodeops 与节点下标。 */
 static int
 tmpfs_create_op(struct vnode *dv, const char *name, struct vnode **vpp)
 {
 	struct tmpfs_node *n;
 	struct vnode *vp;
+	int idx;
 
 	if (dv != &tmpfs_rootv)
 		return (-ENOENT);
-	n = tmpfs_create_node(name, 0);
+	spin_lock(&tmpfs_lock);
+	n = tmpfs_create_node_locked(name, 0);
+	idx = (n != 0) ? (n - tmpfs_nodes) : -1;
+	spin_unlock(&tmpfs_lock);
 	if (n == 0)
 		return (-ENOSPC);
 	vp = vn_alloc();
@@ -313,13 +409,13 @@ tmpfs_create_op(struct vnode *dv, const char *name, struct vnode **vpp)
 		return (-ENOMEM);
 	vp->type = VREG;
 	vp->ops = &tmpfs_vnodeops;
-	vp->node = n - tmpfs_nodes;
+	vp->node = idx;
 	*vpp = vp;
 	return (0);
 }
 
-/* EN: Unlinks a regular file from the tmpfs root: -ENOENT for a non-root dir or a missing/dir entry, else frees the node data page via tmpfs_putdata() and clears n->used. */
-/* 中文：从 tmpfs 根目录删除普通文件：非根目录或找不到/本身是目录的表项返回 -ENOENT，否则用 tmpfs_putdata() 释放节点数据页并清除 n->used。 */
+/* EN: Unlinks a regular file from the tmpfs root: -ENOENT for a non-root dir or a missing/dir entry, else frees the node data page via tmpfs_putdata_locked() and clears n->used. */
+/* 中文：从 tmpfs 根目录删除普通文件：非根目录或找不到/本身是目录的表项返回 -ENOENT，否则用 tmpfs_putdata_locked() 释放节点数据页并清除 n->used。 */
 static int
 tmpfs_remove_op(struct vnode *dv, const char *name)
 {
@@ -327,37 +423,52 @@ tmpfs_remove_op(struct vnode *dv, const char *name)
 
 	if (dv != &tmpfs_rootv)
 		return (-ENOENT);
-	n = tmpfs_find(name);
-	if (n == 0 || n->isdir)
+	spin_lock(&tmpfs_lock);
+	n = tmpfs_find_locked(name);
+	if (n == 0 || n->isdir) {
+		spin_unlock(&tmpfs_lock);
 		return (-ENOENT);
-	tmpfs_putdata(n);
+	}
+	tmpfs_putdata_locked(n);
 	n->used = 0;
+	spin_unlock(&tmpfs_lock);
 	return (0);
 }
 
-/* EN: Creates a subdirectory only under the tmpfs root: -ENOENT for another directory, -EEXIST if the name is already used, otherwise tmpfs_create_node(name,1) yielding 0 or -ENOSPC. */
-/* 中文：仅在 tmpfs 根目录下建立子目录：非根目录返回 -ENOENT，名字已被占用返回 -EEXIST，否则调用 tmpfs_create_node(name,1)，成功返回 0、失败返回 -ENOSPC。 */
+/* EN: Creates a subdirectory only under the tmpfs root: -ENOENT for another directory, -EEXIST if the name is already used, otherwise tmpfs_create_node_locked(name,1) yielding 0 or -ENOSPC. */
+/* 中文：仅在 tmpfs 根目录下建立子目录：非根目录返回 -ENOENT，名字已被占用返回 -EEXIST，否则调用 tmpfs_create_node_locked(name,1)，成功返回 0、失败返回 -ENOSPC。 */
 static int
 tmpfs_mkdir_op(struct vnode *dv, const char *name)
 {
+	int rv;
 
 	if (dv != &tmpfs_rootv)
 		return (-ENOENT);
-	if (tmpfs_find(name) != 0)
-		return (-EEXIST);
-	return (tmpfs_create_node(name, 1) ? 0 : -ENOSPC);
+	spin_lock(&tmpfs_lock);
+	if (tmpfs_find_locked(name) != 0)
+		rv = -EEXIST;
+	else
+		rv = tmpfs_create_node_locked(name, 1) ? 0 : -ENOSPC;
+	spin_unlock(&tmpfs_lock);
+	return (rv);
 }
 
-/* EN: Truncates to zero length: frees the data page via tmpfs_putdata() (also zeroing n->pa/n->size) and purges the vnode page cache; a directory gives -EISDIR. */
-/* 中文：用 tmpfs_putdata() 释放数据页（同时清零 n->pa 与 n->size）并 purge 该 vnode 页缓存，把 tmpfs 文件截断到 0 长度；目录返回 -EISDIR。 */
+/* EN: Truncates to zero length: frees the data page via tmpfs_putdata_locked() (also zeroing n->pa/n->size) and purges the vnode page cache; a directory gives -EISDIR. */
+/* 中文：用 tmpfs_putdata_locked() 释放数据页（同时清零 n->pa 与 n->size）并 purge 该 vnode 页缓存，把 tmpfs 文件截断到 0 长度；目录返回 -EISDIR。 */
 static int
 tmpfs_truncate_op(struct vnode *vp)
 {
 	struct tmpfs_node *n = &tmpfs_nodes[vp->node];
 
-	if (n->isdir)
-		return (-EISDIR);
-	tmpfs_putdata(n);
+	spin_lock(&tmpfs_lock);
+	if (!n->used || n->isdir) {
+		int err = n->used ? -EISDIR : -ENOENT;
+
+		spin_unlock(&tmpfs_lock);
+		return (err);
+	}
+	tmpfs_putdata_locked(n);
+	spin_unlock(&tmpfs_lock);
 	pagecache_purge_vp(vp);
 	return (0);
 }
@@ -371,11 +482,15 @@ tmpfs_rmdir_op(struct vnode *dv, const char *name)
 
 	if (dv != &tmpfs_rootv)
 		return (-ENOENT);
-	n = tmpfs_find(name);
-	if (n == 0 || !n->isdir)
+	spin_lock(&tmpfs_lock);
+	n = tmpfs_find_locked(name);
+	if (n == 0 || !n->isdir) {
+		spin_unlock(&tmpfs_lock);
 		return (-ENOENT);
-	tmpfs_putdata(n);
+	}
+	tmpfs_putdata_locked(n);
 	n->used = 0;
+	spin_unlock(&tmpfs_lock);
 	return (0);
 }
 
@@ -385,21 +500,42 @@ static int
 tmpfs_rename_op(struct vnode *dv, const char *old, const char *new)
 {
 	struct tmpfs_node *n;
-	int len;
+	int len, rv;
 
 	if (dv != &tmpfs_rootv)
 		return (-EROFS);
-	n = tmpfs_find(old);
+	rv = 0;
+	spin_lock(&tmpfs_lock);
+	n = tmpfs_find_locked(old);
 	if (n == 0)
-		return (-ENOENT);
-	if (tmpfs_find(new) != 0)
-		return (-EEXIST);
-	len = strlen(new);
-	if (len == 0 || len >= TMPFS_NAMELEN)
-		return (-ENAMETOOLONG);
-	bzero(n->name, TMPFS_NAMELEN);
-	bcopy(new, n->name, len + 1);
-	return (0);
+		rv = -ENOENT;
+	else if (tmpfs_find_locked(new) != 0)
+		rv = -EEXIST;
+	else {
+		len = strlen(new);
+		if (len == 0 || len >= TMPFS_NAMELEN)
+			rv = -ENAMETOOLONG;
+		else {
+			bzero(n->name, TMPFS_NAMELEN);
+			bcopy(new, n->name, len + 1);
+		}
+	}
+	spin_unlock(&tmpfs_lock);
+	return (rv);
+}
+
+/*
+ * §7.2.1 item 4: lets write(2) tell a tmpfs vnode from a disk-backed one.
+ * Only tmpfs is safe to drive with the BKL released today; JLFS still needs
+ * the BKL for its ATA/journal path, so the syscall keeps that one serialised.
+ * 中文：供 write(2) 区分 tmpfs 与磁盘后端。当前只有 tmpfs 可以在放掉 BKL 的情况下安全驱动，
+ * JLFS 的 ATA/日志路径仍需 BKL，因此那条路径保持串行。
+ */
+int
+tmpfs_is_vnode(struct vnode *vp)
+{
+
+	return (vp != 0 && vp->ops == &tmpfs_vnodeops);
 }
 
 struct vnodeops tmpfs_vnodeops = {

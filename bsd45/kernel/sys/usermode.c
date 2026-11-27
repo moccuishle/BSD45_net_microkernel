@@ -6145,18 +6145,56 @@ bsd45_syscall(struct sysregs *r)
 			break;
 		}
 		if (cur->uk_fds[fd].used && cur->uk_fds[fd].vp != 0) {
-			int n2;
+			struct vnode *vp2;
+			unsigned off2;
+			int n2, nodrop;
 
 			/*
-			 * Synchronous VFS write: vfs_write_sync() runs the
-			 * backend in this context; async uses vfs_write_async.
-			 * 同步 VFS 写：vfs_write_sync() 在本地上下文执行后端；
-			 * 异步走 vfs_write_async。
+			 * §7.2.1 item 4: write(2) on a tmpfs file drops the BKL.
+			 * Same template as read(2) (§6.2.9): validate the
+			 * descriptor, vn_ref() the vnode and snapshot the
+			 * offset under fd_lock, run the backend unlocked, then
+			 * commit the offset only if the descriptor still names
+			 * the same vnode.  tmpfs now has its own node lock
+			 * (tmpfs_lock), so the lazily allocated data page and
+			 * n->size can no longer be mutated under us.
+			 *
+			 * Only tmpfs is gated in: JLFS writes still go out
+			 * through ATA + the journal, which the BKL still
+			 * serialises until its own lock audit is done.
+			 * 中文：§7.2.1 第 4 条：tmpfs 文件的 write(2) 摘掉 BKL。与 read(2)
+			 * （§6.2.9）同一模板：在 fd_lock 内校验 fd、vn_ref 固定 vnode 并取偏移
+			 * 快照，后端在放锁后执行，只有 fd 仍指向同一 vnode 时才回写偏移。
+			 * tmpfs 现在有节点锁，惰性分配的数据页与 n->size 不会再被并发改写。
+			 * 只放行 tmpfs：JLFS 写仍走 ATA + 日志，BKL 继续串行它。
 			 */
-			n2 = vfs_write_sync(cur->uk_fds[fd].vp,
-			    cur->uk_fds[fd].off, (const void *)buf, len);
-			if (n2 > 0)
-				cur->uk_fds[fd].off += n2;
+			spin_lock(&fd_lock);
+			vp2 = cur->uk_fds[fd].vp;
+			if (vp2 == 0) {
+				spin_unlock(&fd_lock);
+				r->eax = (unsigned)-EBADF;
+				break;
+			}
+			off2 = cur->uk_fds[fd].off;
+			nodrop = !tmpfs_is_vnode(vp2);
+			vn_ref(vp2);
+			spin_unlock(&fd_lock);
+
+			if (nodrop)
+				n2 = vfs_write_sync(vp2, off2,
+				    (const void *)buf, len);
+			else {
+				smp_bkl_drop();
+				n2 = vfs_write_sync(vp2, off2,
+				    (const void *)buf, len);
+				smp_bkl_enter();
+			}
+
+			spin_lock(&fd_lock);
+			if (n2 > 0 && cur->uk_fds[fd].vp == vp2)
+				cur->uk_fds[fd].off = off2 + (unsigned)n2;
+			spin_unlock(&fd_lock);
+			vn_put(vp2);
 			r->eax = (unsigned)n2;
 			break;
 		}
@@ -6219,6 +6257,7 @@ bsd45_syscall(struct sysregs *r)
 			pp->count += n;
 			pipe_wake_reader_locked(pp, 0);
 			spin_unlock(&pipe_lock);
+			smp_bkl_enter();
 			r->eax = n;
 			break;
 		}
