@@ -1,14 +1,17 @@
 # BSD45-ELF-x86 任务恢复文本（入口 + 缓存系统 S17）
 
-更新时间：2026-11-26（Asia/Shanghai）
-状态：**S0–S17 全部落地**；当前工作在 **P2（BKL 拆分）**：VFS / pipe /
-page cache / buffer cache / name cache / fd 表均已分锁，**普通文件 `read(2)`
-已离开 BKL**（§6.2.9），其余系统调用仍在 BKL 内。
+更新时间：2026-11-28（Asia/Shanghai）
+状态：**S0–S17 全部落地**；P2（BKL 拆分）已推进到 `open(2)`/namei
+（§6.2.17）；微内核路线已放弃并删除实现（§6.2.18）；`kernel/` 下的 x86 汇编
+（含内联）已全部收进 `kernel/arch/i386/`（§6.2.19）；
+**唯一未收口的是 aio 应答丢失修复（§6.2.20）——代码已改完、编译通过、26 套
+验收已跑，只缺 8 核复现验证，改动仍在工作区未提交，见 §7.0.1。**
 仓库：https://github.com/moccuishle/BSD45_multi_core_process （5 仓同步，见 §0.4）
 
 > **新机器请直接跳到 [§0.4 新机器快速恢复](#04-新机器快速恢复2026-11-26)**：
 > 克隆 5 仓、装工具链、构建、跑全套验收、以及"上次停在哪、下一步做什么"。
-> 下一步的具体动作见 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)。
+> **下次开工第一件事是 §7.0.1「aio 应答丢失修复收尾」**（唯一未验收的改动）；
+> 之后的具体动作见 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)。
 
 > 本文件是恢复入口，并**合并了原 `恢复.md`**（4.5BSD VFS/VM 缓存层盘点与路线）。
 > 完整的 S0–S17 功能记录、43+ 条踩坑、构建脚本细节在
@@ -1062,6 +1065,71 @@ arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效*
 等**纯宏与类型定义**，没有指令，不属本次范围；将来若真要支持第二种架构，
 这两个目录应该一起并入 `arch/<arch>/include/`。
 
+### 6.2.20 收掉 aiotest 偶发挂起：aio 握手 + 队列归属（2026-11-28）
+
+**症状**：8 核 3 GB 跑完整序列（`rdstress`→`pthread`→`pthmain`→`pthpre`→
+`aiotest`）时，`aiotest` 约 **1/2 概率**停在第一条 `aio_wait` 上；QEMU 的 CPU
+时间几乎不涨（全部核停在 `hlt`），没有 TRAP / panic。单独跑
+`rdstress+aiotest`、`pthread×3+aiotest` 都不复现——必须先有线程测试把 TCB
+"染"过多个核。
+
+**两个独立的丢唤醒，都不是 aio 自己的逻辑错**：
+
+1. **aio 侧：检查与阻塞不是原子的。** `aio_wait_sys()` 先看 `s->a_done`，再
+   `kthread_block_tcb()` 把进程置 `P_BLOCKED`；`aio_soft()` 靠
+   `p->uk_state == P_BLOCKED && uk_aio_wait_token == s->a_token` 判断"有人在等"。
+   完成正好落在这两步之间时，`aio_soft` 看到 `P_RUN` 就认为无人等待，而等待方
+   紧接着睡在一个**已经完成**的 token 上——永远没人再碰它。这是"检查后阻塞"
+   的经典竞态，只是平时窗口窄。
+2. **调度侧：队列位置与 TCB 归属不一致。** `sched_rq_pick(cpu)` 用
+   `kthread_owned_by_other(t, cpu)` 跳过"属主是别的核"的 TCB（属主是栈互斥），
+   但 `sched_rq_put(t, cpu)` 有两处把线程放到了**非属主**的队列上：
+   `proc_sched()` 的"抢占失败重新入队"（把从别人队列偷来的 TCB 放到偷窃者
+   队列）、`sched_rq_sweep()`（一律放扫描者队列）。一旦落到那里，属主队列里
+   没有它、其它核 pick 时又跳过它 → 永久隐身，整机空转。
+
+**改动**（4 处，全部在 `kernel/sys/usermode.c`）：
+
+| 位置 | 改动 |
+|---|---|
+| 新增 `aio_lock` | aio 槽状态与 `aio_next_token` 的保护锁；锁序 `aio_lock → sc_rqlock`、`aio_lock → vfs_lock`，反向不存在 |
+| `aio_wait_sys()` | 槽位扫描 + 完成检查 + 发布 token + 置 `P_BLOCKED` 全在一个临界区；`proc_sched()` 前解锁（不能在持自旋锁时切栈） |
+| `aio_soft()` | "判断并唤醒"同锁；`a_woken` 与 `a_used=0` 也在锁内，避免二次唤醒/二次 `vn_put` |
+| `aio_submit_sys()` / `aio_poll_sys()` | 认领空槽 + 发 token 加锁（两核并发会拿到同一个空槽、同一个 token）；poll 与完成软中断都可能释放槽位，必须互斥 |
+| `sched_rq_put()` | **入队 CPU 由 TCB 属主决定**，入参只作提示：属主在线就排属主队列；属主已不在（AP 没起来/被停）则 `kthread_release_cpu()` 后按提示排，避免钉死在死核上；排到远端且该核已 park 时补一个 IPI |
+
+**为什么不是"加个超时重试"**：重试只会把必然的丢失变成概率性变慢；两处都是
+"决定与动作分离"，把决定和动作放进同一临界区才是收敛的修法。
+
+**当前状态（2026-11-28 07:46 暂停时的真实进度）**：
+
+| 项 | 状态 |
+|---|---|
+| 代码改动（5 处，`usermode.c`） | ✅ 已改完，**未提交，仍在工作区** |
+| 编译（`build_all.sh` + `build_iso.ps1`） | ✅ 通过，`out/BSD45-ELF-x86.iso` 07:38 生成 |
+| 26 套验收 `tools/all_tests.sh` | ✅ **24 PASS + 2 已知失效**（`test_subsys`/`test_ipl`，与改动前逐套一致，无新增失败） |
+| 8 核 3 GB 复现验证 | ❌ **未完成**——这是唯一缺口，见 §7.0.1 |
+| 上库（主仓 + 4 镜像） | ❌ 未做（等 8 核验证通过后再提） |
+
+**8 核验证为什么没跑完**：两次尝试都报废在测试台而非内核上。
+`aioA` 那轮 `qdrive.py` 没把 QEMU 拉起来（日志停在 `# ` 提示符、QEMU 进程
+CPU 时间不涨），改用 `-serial file:` 手工起 QEMU 只证明了 8 核未 `smpon`
+时是普通单核启动（"1 CPU (SMP disabled)"），没拿到 aio 数据。
+**结论：修复既没有被证实，也没有被证伪**——所以先按"未验收"记录，下次从
+§7.0.1 步骤 0 重跑（补丁已随文档入库，新机器打上即可）。
+
+**改动前同一序列的复现率约 1/2**（`reg8d`/`reg8f` 两次挂起、
+`reg8e`/`reg8g`/`asm8` 通过），因此**只需两轮全通过**即可认为收敛；
+若两轮里任何一次仍挂起，说明还有第三个丢唤醒点，回到本节的思路继续找
+（下一个怀疑对象见下面"同形状的债"）。
+
+**同形状的债（本次未动，已登记）**：`thread/sync.c` 的
+`waitq_sleep()` + `sync_wake()` 是同一个"先出队再置 `KT_BLOCK`"的顺序——
+`sync_wake()` 要求 `t_state == KT_BLOCK`，而 `waitq_sleep()` 在释放
+`wq_lock` 之后才置该状态，所以唤醒可能被丢掉。mutex/condvar 目前没有暴露
+问题（等待者被唤醒后会重新检查条件），但和 aio 是同一类缺陷，值得按同样
+方式收口。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -1093,7 +1161,9 @@ arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效*
 
 > 把 §6.1 / §6.2.2 / §6.3 / §6.4 里"未完成"的事项收敛成任务卡：每张卡都给出
 > **代码起点 → 前置依赖 → 动手步骤 → 验收命令 → 已知坑**。
-> 当前 HEAD `b75deba`，5 仓树一致 `6b88cbb`，工作区干净。
+> 当前 HEAD `83f46b7`（汇编归位），工作区**不干净**：aio 修复未提交（§7.0.1，
+> 已导出 `docs/patches/S432-aio-wakeup.patch`），另有本轮生成物
+> `bsd45/hdd/BSD45.JLFS` 需 `git checkout --` 还原。
 > 开工前先读 §6.2.2（BKL 拆分状态）与 §6.2.4（构建/测试工具与三个坑）。
 
 ### 7.0 每次开工的固定动作
@@ -1119,6 +1189,118 @@ arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效*
 5. 上库：主仓 `git push origin main`；4 个镜像用
    `git commit-tree $(git rev-parse HEAD^{tree}) -p <remote>/main` 生成提交后
    push，最后 `git fetch` 校验 5 棵树一致。
+
+### 7.0.1 P0 — aio 应答丢失修复收尾（未验收，工作区里未提交）
+
+> **下次开工从这里开始，不要先动别的。** 背景、症状、根因见 §6.2.20。
+> 一句话：代码改完了、编译过了、26 套验收过了，**只缺 8 核 3 GB 复现验证**。
+> 新机器照下面 0→5 走完即可收口并上库。
+
+**为什么代码不在 main 上**：改动未经 8 核验证，按本项目的上库规矩（验收通过
+才算完成）不能进 main，因此导出成补丁随文档一起提交：
+`docs/patches/S432-aio-wakeup.patch`（275 行、11 个 hunk，只碰
+`bsd45/kernel/sys/usermode.c`）。已在 HEAD 的 LF 干净树上验证
+`git apply --check` 通过。
+
+**涉及的东西**（改动全在 `kernel/sys/usermode.c`）：
+
+| 位置 | 改了什么 |
+|---|---|
+| 新增 `static struct spinlock aio_lock` | 保护 aio 槽状态与 `aio_next_token`；锁序 `aio_lock → sc_rqlock`、`aio_lock → vfs_lock`，反向不存在 |
+| `aio_wait_sys()` | 槽位扫描 + `a_done` 检查 + 发布 token + 置 `P_BLOCKED` 同一临界区，`proc_sched()` 前解锁 |
+| `aio_soft()` | "判断有无等待者 + 唤醒 + 释放槽"同锁，避免二次唤醒 / 二次 `vn_put` |
+| `aio_submit_sys()` / `aio_poll_sys()` | 认领空槽 + 发 token 加锁 |
+| `sched_rq_put()` | 入队 CPU 由 TCB 属主决定（`t_oncpu`），入参只作提示；属主已下线则 `kthread_release_cpu()` 后按提示排；排到已 park 的远端核补一个 IPI |
+
+#### 步骤 0：拿代码 + 打补丁
+
+```sh
+git clone git@github.com:moccuishle/BSD45_multi_core_process.git
+cd BSD45_multi_core_process
+git apply docs/patches/S432-aio-wakeup.patch
+git status --short          # 只应有 bsd45/kernel/sys/usermode.c
+```
+
+#### 步骤 1：构建
+
+```sh
+cd bsd45
+bash build_all.sh && bash build_iso.sh        # 或 Windows：build_*.ps1
+ls -l out/BSD45-ELF-x86.iso                   # 时间戳必须是刚生成的
+```
+
+构建完**必须** `git checkout -- bsd45/hdd/BSD45.JLFS`（ISO 构建会改这个
+镜像文件，见 §6.2.4）。
+
+#### 步骤 2：26 套验收（约 60 s）
+
+```sh
+bash tools/all_tests.sh
+```
+
+判据：**24 PASS + 2 已知失效**（`test_subsys` / `test_ipl` 因 `36a84a1`
+删除 subsys/IPL 已失效，见 §6.2.5）。**出现任何第 3 个失败就停**，说明 aio
+锁或 `sched_rq_put()` 影响了别的路径。
+
+#### 步骤 3：8 核 3 GB 复现验证（**关键，之前就是死在这一步**）
+
+```sh
+export PATH=/c/msys64/ucrt64/bin:$PATH MSYS_NO_PATHCONV=1
+cd bsd45
+rm -f C:/tmp/aioA.log C:/tmp/aioB.log
+python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 \
+    --timeout 620 --log C:/tmp/aioA.log \
+    --cmd smpon --cmd smpuser --cmd "shell+12" --cmd "/bin/rdstress+45" \
+    --cmd "/bin/pthread+40" --cmd "/bin/pthmain+35" --cmd "/bin/pthpre+35" \
+    --cmd "/bin/aiotest+50" --cmd "/bin/aiotest+50" --cmd ps --cmd "exit 0"
+```
+
+通过后**把 log 改成 `aioB` 原样再跑一轮**（两轮都要过；改动前同一序列的挂起
+概率约 1/2，见 §6.2.20）。
+
+判据（两轮各自满足）：
+
+- 每条 `/bin/aiotest` 打印 **PASS**（每轮 2 次，共 4 次）；
+- 全文 **0 个 `TRAP`**、无 `triple fault`、无 `STACK OVERFLOW`；
+- 以 `[user exit 0]` 结束，`ps` 有正常输出（不是空表）。
+
+#### 步骤 4：结果怎么处置
+
+- **两轮全过** → 认为收敛，进步骤 5 上库。
+- **任一轮仍挂起**（`aiotest` 停在 `aio_wait`、QEMU CPU 时间不涨）→ 说明还有
+  第三个丢唤醒点。**先别改代码**，按 §6.2.20 的排查顺序往下走：
+  `thread/sync.c` 的 `waitq_sleep()` + `sync_wake()`（"先出队再置
+  `KT_BLOCK`"，唤醒会被丢），以及 `proc_wake()` 到 `sched_rq_pick()` 之间的
+  其它 `sched_rq_put()` 调用点。补丁本身不要撤——它是必要条件、不是错误。
+- **出现第 3 个验收失败 / 新 TRAP** → 补丁有问题，`git apply -R
+  docs/patches/S432-aio-wakeup.patch` 回退后重新定位。
+
+#### 步骤 5：上库（5 仓同步，见 §7.0 第 5 条）
+
+```sh
+git add bsd45/kernel/sys/usermode.c
+git rm docs/patches/S432-aio-wakeup.patch      # 代码进 main 后补丁即失效
+git commit -m "S432: close the aio completion race and pin requeues to the owner CPU"
+git push origin main
+# 4 个镜像：commit-tree $(git rev-parse HEAD^{tree}) -p <remote>/main → push
+git fetch && 校验 5 棵树一致
+```
+
+提交说明的要点（照抄即可）：两处独立的丢唤醒——aio 的"检查后阻塞"竞态、调度
+侧的"队列位置与 TCB 归属不一致"；修法是把决定与动作放进同一临界区，而不是加
+超时重试。
+
+**已知坑（踩过）**：
+
+- `qdrive.py` 靠 `qemu-system-i386` 在 PATH 里，否则子进程 `FileNotFoundError`
+  但脚本只报 "cannot connect to serial port"，看起来像内核没起来。
+- `--log` 是**追加**写，重跑前必须 `rm -f`，否则会把上一轮的 PASS 当成这一轮。
+- **同一时间只能跑一个 QEMU**：并行会抢端口/CPU，日志为空。
+- `boot timeout (no monitor prompt)` 未必是失败——命令仍会照发，判据看 PASS 行。
+- 别用 `-serial wait=off` 手工起 QEMU 代替 qdrive：那样客人先跑、提示符滚过，
+  而且**不 `smpon` 就是单核**（日志里 "1 CPU (SMP disabled)"），拿不到 SMP 证据。
+- 26 套并行驱动脚本每轮删 50+ 日志会撞安全删除上限，用写入新目录的那版
+  （`C:\tmp\tr_MMdd_HHmmss`，见 §6.2.11）。
 
 ### 7.1 P1 — 长时间 soak，再把 `smp_user_dispatch` 默认改为 1（§6.1.1 / 6.1.2）
 
