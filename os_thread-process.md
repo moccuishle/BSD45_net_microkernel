@@ -398,8 +398,7 @@ monitor → "usermode" → 进入用户态跑 /sbin/init
 
 ## 十二、S400：用户态同步原语
 
-S400 给用户态补上 mutex / condition variable（详见 `os_microkernel.md`），
-供用户态服务内部协作使用：
+BSD45 的用户态线程库补上了 mutex / condition variable，供用户程序内部协作使用：
 
 - `pthread.h` 新增 `pthread_mutex_t` / `pthread_cond_t` 及
   `pthread_mutex_{init,lock,trylock,unlock,destroy}`、

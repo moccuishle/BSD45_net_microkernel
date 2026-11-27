@@ -48,7 +48,7 @@
 
 - **定位**：可写 `/tmp` 后端，从 `vfs.c` 里拆出来的（S100.2a）。
 - **模型**：**一个文件一页**（4 KB），页通过 `pmap_map()` 映射进内核窗口，页的所有权交给 `vfs_page_alloc/free/unmap`。
-- **边界**：只通过 `docs/kernel-boundary.md` 列的 KP-2 / KP-3 原语和 VFS 助手 `vn_alloc()/vn_put()` 与内核交互，**不碰进程表、调度器和页分配器**。
+- **边界**：只通过 KP-2 / KP-3 原语（`pmap_map` / `vfs_page_*`）和 VFS 助手 `vn_alloc()/vn_put()` 与内核交互，**不碰进程表、调度器和页分配器**。
 - **能力**：12 个 vnodeops 全实现，可写、可 rename。
 
 ## 三、根文件系统的选择顺序（`sys/glue.c: main()`）

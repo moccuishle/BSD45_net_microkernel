@@ -238,23 +238,6 @@ struct	process {
 	int		uk_ipc_waiting;		/* nonzero: blocked in ipc_recv / nonzero:阻塞在 ipc_recv */
 	unsigned	uk_ipc_port;		/* port being waited on / 等待的端口 */
 	unsigned	uk_ipc_msguser;		/* user address of msg buffer / msg 缓冲用户地址 */
-	/*
-	 * KVFS: kernel-side /srv/ transparent forwarding resume state.
-	 * A user thread blocked in a forwarded open/read/write has its full
-	 * syscall context saved in uk_regs plus these fields; the IPC reply
-	 * handler fills the result back and wakes it.  Serialized: only one
-	 * in-flight kernel forwarding transaction at a time (cooperative CPU).
-	 * KVFS: 内核态 /srv/ 透明转发续传状态。阻塞在转发 open/read/write 的
-	 * 用户线程把完整 syscall 上下文存 uk_regs 外加这些字段；IPC 回复处理
-	 * 程序回填结果并唤醒。串行化：同一时刻只有一个在途内核转发事务。
-	 */
-	int		uk_kvfs_waiting;	/* nonzero: blocked in kernel VFS forward */
-	unsigned	uk_kvfs_op;		/* SRV_* op being awaited / 等待的 SRV_* 操作 */
-	unsigned	uk_kvfs_buf;		/* user buffer VA for READ result / READ 回填用户缓冲 */
-	unsigned	uk_kvfs_len;		/* requested length / 请求长度 */
-	unsigned	uk_kvfs_handle;		/* srv handle for this op / 本操作的服务句柄 */
-	/* per-process virtual fds for /srv/ paths (0x4000 base, handle+1 / 0=free) */
-	unsigned	uk_kvfs_fds[8];
 };
 
 #define	p_session	p_pgrp->pg_session

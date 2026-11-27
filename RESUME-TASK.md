@@ -31,7 +31,7 @@ page cache / buffer cache / name cache / fd 表均已分锁，**普通文件 `re
 ### 0.2 文档同步
 
 - `bsd45/README.md` 目录树已更新为合并后的结构
-- `docs/cache-mmap.md`、`docs/kernel-boundary.md` 中的 `usermode.c`、
+- `docs/cache-mmap.md` 中的 `usermode.c`、
   `pagecache.c`、`glue.c` 等路径已更新
 
 ### 0.3 下一步
@@ -148,7 +148,6 @@ bash tools/all_tests.sh        # 17 套，预期最后两行：suites failed: 0 
 | 内核 VFS/驱动/进程层 | `bsd45/kernel/fs/`、`driver/`、`other/` |
 | 测试驱动 | `bsd45/tools/run_qemu_test.{ps1,sh}`、`all_tests.sh` |
 | 缓存/mmap 设计（S17） | `docs/cache-mmap.md` |
-| 内核边界契约（S100.1） | `docs/kernel-boundary.md` |
 
 `bsd45/src/` 已删除，构建**不需要任何 tarball**。
 
@@ -286,8 +285,6 @@ ALL SUITES PASSED
 
 - [`bsd45/RESUME-TASK.md`](bsd45/RESUME-TASK.md)：完整 S0–S17 记录、构建/验收、43+ 坑
 - [`docs/cache-mmap.md`](docs/cache-mmap.md)：S17 设计、数据流、坑
-- [`docs/kernel-boundary.md`](docs/kernel-boundary.md)：内核边界与原语契约（S100.1）
-- [`docs/microkernel-design.md`](docs/microkernel-design.md)：微内核设计（S100.2）
 - [`shell.md`](shell.md)：PowerShell → bash 的固化写法与避坑
 - [`os_lock_preempt.md`](os_lock_preempt.md)：**锁设计方法论 + BSD45 的 IRQL/
   preempt 改造方案**（锁的对象是"执行流 × 共享状态"、五步决策链、执行流 ×
@@ -921,16 +918,90 @@ turnstile——不是偷懒，而是重新算了一遍发现**不需要**。
 `export PATH="/c/msys64/ucrt64/bin:$PATH"`。另外 `--log` 是**追加**写的，
 重跑前记得先删旧日志，否则会把上一次的输出混进来。
 
-**一次未复现的挂起（记录在案）**：`reg8d` 那次 8 核基线停在
-`execve /bin/aiotest: entry ...` 之后，五秒内 QEMU 的 CPU 时间几乎不涨
-（354.83 → 354.86），`qdrive` 超时退出。当时机器上**同时跑着第二个
-qemu + qdrive**（端口/CPU 争抢，两份日志都是空的），随后单独连跑 6 次
-`/bin/aiotest` 全部 PASS（`token=3..12`），再跑一次完整 8 核基线
-（`reg8e`，独占机器）也 PASS（`token=1/2`，`[user exit 0]`）。
-倾向判断是并发跑测导致的调度饥饿，而不是 `open(2)` 改动引入的死锁——
+**`aiotest` 偶发挂起（已定位到"唤醒之后"，未修）**：`reg8d`、`reg8f` 两次 8 核
+基线停在 `execve /bin/aiotest: entry ...` 之后，五秒内 QEMU 的 CPU 时间几乎不涨
+（354.83 → 354.86），`qdrive` 超时退出；`reg8e`、`diag2`、`tr2` 同样的二进制
+同一条命令序列又全 PASS，所以是**时序相关**，不是必挂。
+
+为定位加了临时 `AIO-tr:` 追踪（打印后已全部删除），`tr1` 那次复现，输出是：
+
+```
+AIO-tr: wait tok=1 done=0 nthr=1      ← 调用者检查 a_done==0，准备阻塞
+AIO-tr: wait blocked tok=1 state=2    ← kthread_block_tcb 后 uk_state=P_BLOCKED
+AIO-tr: soft tok=1 pid=10             ← 完成侧 aio_soft 进入
+AIO-tr: scan p=1 state=2 wtok=1 want=1 ← 进程在、状态 P_BLOCKED、token 匹配
+```
+
+即 **aio 侧三件事都做对了**：进程阻塞了、完成回调找到了它、token 与 pid 全对上
+（`proc_wake()` 因此必然被调用）。它仍然没被调度回来，说明丢失点在
+`sched_runnable() → sched_rq_put() → sched_rq_pick()` 这一段，不在 aio 逻辑里。
+`tr2` 同一条序列通过，`tr2` 的追踪显示唤醒方 `cpu=0`、TCB `oncpu=0`（同核自唤醒，
+走 `proc_sched()` 的回落路径），失败那次多半是唤醒方与 TCB 属主不同核，
+被 `kthread_owned_by_other()` 留在另一条 runqueue 上而属主核已 park。
+**下一步（未做）**：给 aio 等待加一把 `aio_lock`，把"发布 token + 置 P_BLOCKED"
+与 `aio_soft()` 的"认领 + 唤醒"放进同一临界区（这样也不会再有
+`a_done` 检查与 `kthread_block_tcb()` 之间的丢唤醒窗口）；顺带审
+`sched_rq_pick()` 对 `kthread_owned_by_other()` 的处理——线程若被排进一条
+属主核不会再扫的 runqueue，就再也没人捡它。
 `aiotest` 走的是 `aio_wait_sys()` 阻塞 + `softirq` 唤醒，与 namei 无关；
-但**没有定位到根因**，后续开 `smp_user_dispatch` 默认值前应补一次
-长时间 soak 观察（见 §7.1）。
+后续开 `smp_user_dispatch` 默认值前应补一次长时间 soak 观察（见 §7.1）。
+
+### 6.2.18 回滚微内核：三个用户态服务退出主线（2026-11-28）
+
+**决定：彻底放弃微内核方向，主线只保留宏内核。** 这一步做的是**删除**，不是
+"搬回内核"——先把事实说清楚，免得下次有人照着"改回内核态"去翻历史找不到东西：
+
+- **`fs_server.c` / `devfs_server.c` / `netsrv.c` 从来没有内核态版本。**
+  `git log --all -- '*fs_server.c'` 只有三条记录，全是**新增**：
+  S400 `671346c`（+185 行 `fs_server.c`）、S401 `239adc1`
+  （+385 行 `devfs_server.c`）、S402/S403 `1164316`（+321 行 `netsrv.c`）。
+  它们是在宏内核之上**另加**的一套用户态服务，不是从内核里搬出去的。
+- 所以"回到宏内核"等于**抽掉服务层**，内核原本就在干的活照旧：
+  `/` 与 `/tmp` 由 `kernel/fs/vfs.c` + `isofs.c` + `tmpfs.c` 直接服务，
+  `/dev` 的伪设备由 `kernel/sys/usermode.c` 的 open/read/write 分支直接处理，
+  设备驱动是 `kernel/driver/`（`pccon.c` / `atapi.c` / `ata.c`）。
+- **网络回到"内核没有网络"的原始状态。** `kernel/net` 是 4.5BSD 遗留树，
+  `config.mk` 明写 NOT BUILT，且没有可用网卡驱动（`kernel/driver/dev` 只有
+  ATAPI 光驱）。S403 的用户态协议栈是唯一能跑的网络路径，删掉它就没有网络了
+  ——这是"彻底放弃微内核"的直接代价，符合"回到 S400 之前"的语义。
+
+**删除清单**（每项都已在别处无引用）：
+
+1. `libexec/`：`fs_server.c`、`devfs_server.c`、`netsrv.c`，以及只为它们存在的
+   `srvtest.c`、`devtest.c`、`nettest.c`、`vfstest.c`、`shmtest.c`。
+2. `libc/include/`：`srv.h`、`dev.h`、`net.h`、`shmbuf.h`；`libc/src/libc_sys.c`
+   里 S402 加的 `/srv/` 透明转发段（约 197 行）。
+3. `kernel/`：`include/sys/srvproto.h` 整个文件；`sys/usermode.c` 的 KVFS 段
+   （`kvfs_fd_alloc` / `kvfs_fd_handle` / `kvfs_reply_deliver` / `kvfs_forward`
+   及 `kvfs_waiter` 声明）、`port_release()` 里的在途事务 `-EIO` 钩子、以及
+   `kprocess.h` 的 `uk_kvfs_*` 字段。
+4. 构建：`build_sh.ps1/.sh` 的工具清单、`build_iso.ps1/.sh` 的 ISO 条目里
+   8 个名字（`fs_server`/`srvtest`/`devfs_server`/`devtest`/`shmtest`/
+   `vfstest`/`netsrv`/`nettest`）。
+5. `tools/`：`test_s400.sh`、`test_device.sh`、`test_net.sh`。
+6. 仓库根 `microkernel/`、`monolithickernel/` 两个占位目录（各只有一个
+   README，内容是把 `bsd45` 分叉成两套发布快照的设想）。
+7. 文档：整份删除 `os_microkernel.md`、`os_device-model.md`、`os_net.md`、
+   `docs/microkernel-design.md`、`docs/microkernel-action-plan.md`、
+   `docs/kernel-boundary.md`；`os_ipc-sharedpage.md`、`docs/object-kernel.md`、
+   `os_fs.md`、`os_thread-process.md`、`README.md`、
+   `bsd45/RESUME-TASK.md` 里指向这些文档的链接与"将来做用户态服务"的措辞
+   逐处删掉（IPC 三原语 KP-4/6/7 仍在核内，相关描述保留）。
+
+**保留项与理由**（不是漏删）：
+
+- `kernel/thread/kipc.c` 的 IPC 原语：S300 就有，早于微内核实验，是通用内核
+  机制；`ipctest` 仍在验它。S400 给 `ipc_recv` 补的"真会合阻塞"是无害的通用
+  改进，一并留下。
+- `libc` 的 `pthread_mutex_*` / `pthread_cond_*`：S400 为了服务内部同步加的，
+  但它们是通用用户态原语，和微内核无关。
+- `kernel/net` 遗留树：本来就没参与构建，删它属于另一件事（要么接网卡驱动，
+  要么整树移除），不在本次范围。
+
+**为什么不会影响验收**：三个服务全部是 opt-in——`/srv/` 路径、`srv_*`/`dev_*`/
+`net_*` 用户态 API、以及显式 exec 服务进程。26 套验收没有一套用到它们
+（`all_tests.sh` 的清单里没有 `test_s400`/`test_device`/`test_net`），默认启动
+路径走的是内核 VFS 与 `/dev` 分支。§6.2.17 的 8 核基线在改动前后逐项一致。
 
 ### 6.3 调度 / 作业控制功能缺口
 
@@ -949,10 +1020,11 @@ qemu + qdrive**（端口/CPU 争抢，两份日志都是空的），随后单独
 - **demand paging + COW**：`mmap` 目前只支持 offset 0、`MAP_PRIVATE` 是
   map 时复制；升级到缺页复制需先有用户态 page fault 处理（当前 fault 停机）。
 - **B4 UFS/FFS**：继续暂缓——缺 ATA 硬盘驱动，`kernel/fs/ufs/*` 无实现。
-- **S100 微内核化路线**：`S100.2a`（tmpfs 从 `vfs.c` 拆出）已做；
-  `S100.3`（KP-4/6/7 + `fs_server` 最小实验）、`S100.4`（宏/微度量对照）
-  未开工。硬性约束：不许牺牲 15 套验收、先文档后代码、实验放独立分支
-  `exp/microkernel`（见 `bsd45/RESUME-TASK.md` 的 S100 节）。
+- ~~**S100 微内核化路线**~~：**已于 2026-11-28 放弃**（§6.2.18）。`S100.2a`
+  （tmpfs 从 `vfs.c` 拆出）留在主线——它是纯拆文件、对内核结构有益；
+  `S100.3`/`S100.4` 不再做，S400–S403 落地的三个用户态服务（`fs_server`、
+  `devfs_server`、`netsrv`）连同 IPC 转发层、客户端库、测试与两个占位目录
+  已全部删除。设计文档作历史记录保留并标记废弃。**不要再往这个方向开工。**
 - **路线 A（真·移植 4.5BSD 内核核心）**：恢复 `vfs_bio.c` 删除体、生成
   `vnode_if.h`、带起完整 kern/* 与 VFS 初始化，长期方向，当前验收用不上。
 
@@ -1172,10 +1244,9 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
 - **demand paging + COW**：`mmap` 目前只支持 offset 0、`MAP_PRIVATE` 是
   map 时复制；升级到缺页复制**依赖 7.3**（当前用户态 fault 停机）。
 - **B4 UFS/FFS**：缺 ATA 硬盘驱动，`kernel/fs/ufs/*` 无实现，继续暂缓。
-- **S100 微内核化**：`S100.2a`（tmpfs 从 `vfs.c` 拆出）已做；
-  `S100.3`（KP-4/6/7 + `fs_server` 最小实验）、`S100.4`（宏/微度量对照）
-  未开工。硬约束：不许牺牲 15 套验收、先文档后代码、实验放独立分支
-  `exp/microkernel`（见 `bsd45/RESUME-TASK.md` 的 S100 节）。
+- ~~**S100 微内核化**~~：**2026-11-28 放弃**（§6.2.18）。`S100.2a`（tmpfs 从
+  `vfs.c` 拆出）留在主线；`S100.3`/`S100.4` 取消，S400–S403 的用户态服务与
+  IPC 转发层已删除。不要再排期。
 - **路线 A**：恢复 `vfs_bio.c` 删除体、生成 `vnode_if.h`、带起完整 kern/*
   与 VFS 初始化。
 - **turnstile**：见 §5，四个前提（可睡眠锁 / 多 donor 争同一锁 / 锁嵌套 /

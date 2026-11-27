@@ -118,7 +118,7 @@ bash tools/all_tests.sh
    - `/bin/ps` 增强：进程名 `comm`、`-a`/`-x` 过滤
    - `/bin/kill` 支持 `%job` 写法（需 sh 作业表配合）
    - 真 `fg`/`bg`：sh 监视模式 + `tcsetpgrp` + 后台读终端 `SIGTTIN`（最大项）
-   - 架构方向见 **S100**（微内核 vs 宏内核边界盘点，先文档后代码）
+   - 架构方向：**宏内核**（微内核方向已于 2026-11-28 放弃，见根 `RESUME-TASK.md` §6.2.18）
 3. 提交与推送规则：**当前仓库为 `BSD45_libexec_fulll_userland`；若用户给了新地址，
    先 `git remote set-url origin <新地址>` 再 push；未给地址时按用户指令决定是否推送。**
 
@@ -793,23 +793,10 @@ vmnet8 NAT）：`gcc 15.2.0 + gcc-multilib + libc6-dev-i386`、
 
 **新增文档（仓库根 `docs/`）**
 
-- `docs/kernel-boundary.md`（S100.1）
-  - 真正编进内核的 14 个源文件 + 行数（约 9.3k 行）；特别标注
-    `kernel/sys|vm|net/` 的 4.5BSD 树**没有编译**，只是参考，别拿它估工作量；
-  - 判定原则 + 每个模块的「留内核 / 可上移」表；
-  - **KP-1..KP-9 内核原语契约**：已有 `user_ok`(KP-1)、`pmap_map`/`vfs_page_*`
-    (KP-2/3)、`inb/outb`(KP-5)、`gettimeofday`(KP-8)；缺
-    `block_on/wakeup`(KP-4) 与 IPC/共享页(KP-6/7)；
-  - 违规审计（基于 `c89e4fd`）：**硬违规 0**——FS/驱动没有直接碰进程表、
-    调度器、页分配器；层次债 8 处（isofs 直接调 `atapi_*`、vfs 直接
-    `pmap_map`），每条都标了迁移阶段。
-- `docs/microkernel-design.md`（S100.2）
-  - 方案 A（宏内核加固）vs B（微内核化）的成本对照；
-  - IPC：消息格式、端口表、会合语义、共享页「谁分配谁释放 + ACK」协议；
-  - 一次 `read("/tmp/a")` 的完整路径（syscall → 转发 → fs_server → 共享页 → 回程）；
-  - 服务布局（`/sbin/fs_server`、`/sbin/tty_server`、内核内 bdev）与启动序列
-    （含 10 秒看门狗回退 ramfs）；
-  - 故障模型、`-Variant mono|micro` 构建开关、度量指标、风险与回退。
+- 当时产出两份设计文档（`docs/kernel-boundary.md`、
+  `docs/microkernel-design.md`）以及 `tools/check-boundary.sh` 边界检查脚本。
+  **两份文档已随微内核方向删除**；`check-boundary.sh` 保留——它校验的是
+  "FS/驱动不许直接碰进程表/调度器/页分配器"，对宏内核同样有意义。
 
 **新增工具**
 
@@ -956,63 +943,16 @@ ALL SUITES PASSED
 **当前边界**：仍无 demand paging/COW、`mmap` 只支持 offset 0；B4（UFS/FFS）
 按 0.15 继续暂缓（缺 ATA 硬盘驱动和 UFS 源码）。
 
-## S100（长期方向，未开工）微内核与宏内核的边界：盘点、对照实验与取舍
+## S100（已放弃，2026-11-28）微内核与宏内核的边界
 
-> 这是**架构方向**任务，不是功能增量。它不影响 S11–S99 的日常功能开发，
-> 但每完成一个 S1xx 阶段，都应该回来把这份边界表更新一次。
+> 这一节原先规划 S100.1–S100.4：边界盘点、设计对照、tmpfs 服务化实验与
+> 宏/微度量。S400–S403 真的落地了三个用户态服务（`fs_server` /
+> `devfs_server` / `netsrv`），随后在 2026-11-28 全部撤销：用户态服务、
+> IPC 转发层、客户端库、测试、两个占位目录与四份设计文档一并删除，
+> 主线只保留宏内核。唯一保留的成果是 S100.2a（tmpfs 拆成独立文件，
+> 见 0.14）。撤销的原因与完整清单见仓库根 `RESUME-TASK.md` §6.2.18。
 
-### 现状（宏内核）
-
-当前 BSD45 是**宏内核**：VFS/vnode 层、tmpfs、ISO9660、ATAPI 驱动、控制台 tty、
-进程表与调度、信号与管道，全部跑在 ring 0 的同一个地址空间里。
-好处是本次会话反复验证过的：改一处 `vnodeops` 就能同时影响 syscall 与 execve；
-坏处是任何 FS/驱动的 bug 都能让整机 triple fault（TRAP 12 那几次就是例子）。
-
-### S100.1 边界盘点（先做，纯文档，1 天量级）
-
-产出一张表 `docs/kernel-boundary.md`，逐模块标注：
-
-| 模块 | 当前实现 | 能否移出内核 | 依赖的内核原语 |
-|---|---|---|---|
-| vnode/VFS | `kernel/fs/vfs.c` | 部分（转发层留下） | 拷贝 in/out、vnode 句柄 |
-| tmpfs | `vfs.c` 内 | **可以**（首选实验对象） | 页分配、共享内存 |
-| ISO9660 | `kernel/fs/isofs.c` | 可以（只读、无并发） | ATAPI 块读、缓存 |
-| ATAPI | `kernel/driver/atapi.c` | 驱动力留在内核，协议栈可上移 | 端口 IO、DMA |
-| 控制台 tty | `kernel/driver/pccon.c` | 行规程可上移，中断处理留下 | 中断、环形缓冲 |
-| 进程/信号/管道 | `kernel/other/usermode.c` | **不建议**（微内核也留在核内） | — |
-
-判据：**只有「必须接触特权指令/中断/页表」的才留内核**，其余都可以按 IPC 服务化。
-
-### S100.2 设计对照（文档 + 评审）
-
-写 `docs/microkernel-design.md`，给出两套方案的成本对比：
-
-- **方案 A（宏内核基线）**：现状，补齐模块化（`vnodeops` 已经是雏形）、
-  加内核内断言与崩溃后恢复，把「一个驱动崩全机」的概率压低
-- **方案 B（微内核化）**：内核只留调度/页表/IPC/中断；`fs_server`、`tty_server`
-  以用户态进程运行，VFS 变成「把 vnode 操作翻译成 IPC」的薄转发层
-- 对比维度：syscall 延迟、内存占用、代码行数、崩溃隔离性、调试复杂度
-
-### S100.3 最小可行实验（只做 tmpfs）
-
-1. 内核保留 `vnodeops` 接口，但 `tmpfs_*` 的操作改为向 `fs_server` 发 IPC
-   （同步消息 + 共享页做数据搬运）
-2. `fs_server` 作为 `/sbin/fs_server` 用户态进程，由 init 启动
-3. 早期可用「共享内存 + 自旋」代替完整消息队列，先跑通再优化
-4. 关键指标：`cd /tmp; echo x > a; cat a` 与 15 套验收必须继续全绿
-
-### S100.4 度量与结论
-
-产出 `docs/kernel-boundary-results.md`：
-- 同一组验收（`tools/all_tests.sh`）在两套方案下的耗时
-- 故障注入实验：在 `fs_server` 里主动 panic，宏内核整机挂 vs 微内核只丢文件服务
-- 给出「这个项目应该停在哪一侧」的明确结论与理由
-
-### 硬性约束
-
-1. **不许为了微内核化牺牲已有验收**：任何方案都必须让 15 套全绿；
-2. **先文档后代码**：S100.1/S100.2 没写完不开始 S100.3；
-3. **可回退**：微内核化实验放在独立分支（`exp/microkernel`），主线保持宏内核。
+**不要再往这个方向开工。**
 
 ## 1. 任务目标（原始需求）
 

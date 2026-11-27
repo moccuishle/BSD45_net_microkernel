@@ -150,10 +150,7 @@ if (Test-Path $urb) { Copy-Item $urb "$isodir\bin\uring.ELF" -Force }
 foreach ($pair in @(
     @("spin", "SPIN"), @("cowtest", "COWTEST"), @("crash", "CRASH"),
     @("badptr", "BADPTR"), @("ipctest", "IPCTEST"),
-    @("fs_server", "FSSRV"), @("srvtest", "SRVTEST"),
-    @("devfs_server", "DEVFS"), @("devtest", "DEVTEST"),
-    @("shmtest", "SHMTEST"), @("vfstest", "VFSTEST"), @("proctest", "PROCTEST"),
-    @("netsrv", "NETSRV"), @("nettest", "NETTEST"),
+    @("proctest", "PROCTEST"),
     @("rdstress", "RDSTRESS"))) {
     $srcf = Join-Path $ws ("out\userland\{0}.elf" -f $pair[0])
     if (Test-Path $srcf) { Copy-Item $srcf ("$isodir\bin\{0}.ELF" -f $pair[1]) -Force }

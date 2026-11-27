@@ -39,7 +39,6 @@
 #include "thread/kthread.h"
 #include "sys/smp.h"		/* S413: cpu_id(), per-CPU TSS, BKL */
 #include "sys/kipc.h"		/* S300: IPC / shared-page syscalls */
-#include "sys/srvproto.h"	/* KVFS: kernel-side fs_server protocol */
 /* context-switch hooks are declared in sys/platform.h */
 #include "sys/platform.h"
 #include "sys/platform.h"
@@ -198,6 +197,7 @@ static int	ps_snap_len;
 /* 中文：P2 /dev 伪文件读缓冲锁：ps_snap_buf / mbuf / vbuf 都是文件作用域静态量，两个进程同时读 /dev/ps、/dev/mounts 或 /dev/vmstat 会互相踩。只保护这些缓冲和渲染/拷贝，不跨后端、不等 BKL。 */
 /* EN: P2 /dev pseudo-file buffer lock: ps_snap_buf / mbuf / vbuf are file-scope statics, so two processes reading /dev/ps, /dev/mounts or /dev/vmstat at once would stomp each other. Guards only these buffers + render/copy, never a backend, never the BKL. */
 static struct spinlock devbuf_lock;
+
 
 /*
  * S17: mmap(2).  This port has no demand paging (a page fault stops the
@@ -688,9 +688,6 @@ static unsigned	user_heap_max = USER_HEAP_START + (64u * 1024u * 1024u);
 static unsigned	mmap_base = USER_HEAP_START + (64u * 1024u * 1024u);
 static unsigned	mmap_limit = USER_HEAP_START + (80u * 1024u * 1024u);
 static void	user_layout_init(void);
-/* KVFS: forward declaration of the in-flight forwarding waiter (defined in
- * the KVFS section below) so port-release fault isolation can reach it. */
-static struct process *kvfs_waiter;
 
 /* EN: Accessor for the current user thread's TCB (used by preemption core). */
 struct kthread *
@@ -724,14 +721,14 @@ kthread_block_tcb(void *wchan)
 	if (cur != 0 && cur->uk_p_nthreads <= 1) {
 		cur->uk_state = P_BLOCKED;
 		/*
-		 * KVFS fix: also block the main TCB.  If t_state stays KT_RUN,
+		 * Also block the main TCB.  If t_state stays KT_RUN,
 		 * proc_sched()'s fall-back-to-self branch (mt->t_state==KT_RUN)
 		 * fires and immediately resumes the just-blocked process, so a
-		 * kernel-side forward would "return" with a stale eax instead of
-		 * waiting for the service reply.  proc_wake() restores KT_RUN.
-		 * KVFS 修复：同时阻塞主 TCB。若 t_state 仍为 KT_RUN，proc_sched()
-		 * 末尾的"回落自己"分支会立即恢复刚阻塞的进程，使内核态转发不等
-		 * 回复就带着旧 eax 返回。proc_wake() 会恢复 KT_RUN。
+		 * blocking syscall would "return" with a stale eax instead of
+		 * waiting for its waker.  proc_wake() restores KT_RUN.
+		 * 中文：同时阻塞主 TCB。若 t_state 仍为 KT_RUN，proc_sched()
+		 * 末尾的"回落自己"分支会立即恢复刚阻塞的进程，使阻塞中的系统调用
+		 * 不等唤醒就带着旧 eax 返回。proc_wake() 会恢复 KT_RUN。
 		 */
 		if (t != 0)
 			sched_unrunnable(t, KT_BLOCK);
@@ -3149,17 +3146,6 @@ ipc_fail_waiters(unsigned port)
 	struct process *p;
 	int i;
 
-	/* KVFS: 服务退出时，给在途内核转发事务返回 -EIO，实现故障隔离。
-	 * KVFS: on service exit, fail the in-flight kernel forward with -EIO. */
-	if (port == SRV_PORT_KERNEL && kvfs_waiter != 0 &&
-	    kvfs_waiter->uk_state == P_BLOCKED && kvfs_waiter->uk_kvfs_waiting) {
-		struct process *kw = kvfs_waiter;
-
-		kw->uk_regs.eax = (unsigned)-EIO;
-		kw->uk_kvfs_waiting = 0;
-		kvfs_waiter = 0;
-		proc_wake(kw);
-	}
 	for (i = 0; i < NPROC; i++) {
 		p = &procs[i];
 		if (p->uk_state != P_BLOCKED || !p->uk_ipc_waiting ||
@@ -3171,181 +3157,6 @@ ipc_fail_waiters(unsigned port)
 	}
 }
 
-/* ==================================================================== */
-/* KVFS: kernel-side /srv/ transparent forwarding (serialized transaction) */
-/* KVFS: 内核态 /srv/ 透明转发（串行化事务）                              */
-/* ==================================================================== */
-/*
- * 中文：内核是协作式调度——一个 syscall 在转发处 proc_sched() 阻塞后，整个 CPU
- * 才切到 fs_server；fs_server 回复时 SYS_IPC_SEND 在 fs_server 上下文执行回调。
- * 因此同一时刻最多只有一个内核转发事务在途，用一个全局等待者指针即可定位回复
- * 该回填给谁。回调在 fs_server 的上下文运行，需切到等待者页目录回填用户缓冲。
- * EN: The kernel is cooperatively scheduled - once a forwarding syscall blocks
- * in proc_sched(), the CPU switches to fs_server; its reply triggers the
- * callback inside SYS_IPC_SEND running in fs_server's context.  At most one
- * kernel forwarding transaction is in flight, so one global waiter pointer
- * locates the reply target.  The callback copies into the waiter's buffer
- * under the waiter's page directory.
- */
-
-/*
- * 中文：在等待者进程里分配一个 /srv/ 虚拟 fd（存服务 handle+1），返回虚拟
- * fd 或负 errno。虚拟 fd 从 KVFS_FD_BASE 起，不与内核 fd 冲突。
- * EN: Allocate a /srv/ virtual fd in the waiter (stores handle+1), returning
- * the virtual fd or a negative errno.  Virtual fds start at KVFS_FD_BASE.
- */
-static int
-kvfs_fd_alloc(struct process *p, unsigned handle)
-{
-	int i;
-
-	for (i = 0; i < KVFS_FD_MAX; i++)
-		if (p->uk_kvfs_fds[i] == 0) {
-			p->uk_kvfs_fds[i] = handle + 1;
-			return (KVFS_FD_BASE + i);
-		}
-	return (-EMFILE);
-}
-
-/*
- * 中文：虚拟 fd -> handle（槽位索引），非 KVFS fd 返回 -1。
- * EN: virtual fd -> handle (slot index); -1 if not a KVFS fd.
- */
-static int
-kvfs_fd_handle(struct process *p, int fd)
-{
-	int slot = fd - KVFS_FD_BASE;
-
-	if (slot < 0 || slot >= KVFS_FD_MAX || p->uk_kvfs_fds[slot] == 0)
-		return (-1);
-	return ((int)(p->uk_kvfs_fds[slot] - 1));
-}
-
-/*
- * 中文：回复到达时回填内核转发事务。OPEN 成功时登记虚拟 fd 并把虚拟 fd 作为
- * 返回值；READ 回填用户缓冲并返回字节数；其它操作直接返回 handle 里的结果。
- * 写完 eax 后唤醒等待进程。返回 1 表示已消费此回复。
- * EN: Complete a kernel forwarding transaction on reply.  OPEN registers a
- * virtual fd and returns it; READ copies into the user buffer and returns the
- * byte count; other ops return the handle field.  Wake the waiter after
- * writing eax.  Returns 1 if the reply was consumed.
- */
-static int
-kvfs_reply_deliver(unsigned port, const struct ipc_msg *m)
-{
-	struct process *p = kvfs_waiter;
-	struct srv_args_kernel *wa;
-	int result, data_len;
-
-	if (port != SRV_REPLY_PORT_KERNEL || p == 0 ||
-	    p->uk_state != P_BLOCKED || !p->uk_kvfs_waiting)
-		return (0);
-
-	wa = (struct srv_args_kernel *)m->inline_data;
-	result = (int)wa->handle;	/* handle 字段承载返回值/错误码 */
-
-	if (result >= 0) {
-		if (p->uk_kvfs_op == SRV_OPEN_KERNEL) {
-			/* OPEN：把服务 handle 登记成虚拟 fd，作为 open 返回值 */
-			result = kvfs_fd_alloc(p, (unsigned)result);
-		} else if (p->uk_kvfs_op == SRV_READ_KERNEL) {
-			/* READ：inline_data[8] 起的数据回填到等待者用户缓冲 */
-			data_len = (int)m->len - (int)sizeof(struct srv_args_kernel);
-			if (data_len < 0)
-				data_len = 0;
-			if ((unsigned)data_len > p->uk_kvfs_len)
-				data_len = (int)p->uk_kvfs_len;
-			if (data_len > 0)
-				pipe_copy(p->uk_pd, p->uk_kvfs_buf,
-				    m->inline_data + sizeof(struct srv_args_kernel),
-				    (unsigned)data_len, 1);
-			result = data_len;	/* read 返回实际字节数 */
-		} else if (p->uk_kvfs_op == SRV_CLOSE_KERNEL) {
-			/* CLOSE：服务已确认关闭，释放等待者的虚拟 fd 槽位。
-			 * close 的 fd 参数保存在 uk_regs.ebx（kvfs_forward 保存了完整
-			 * syscall 上下文），据此定位 KVFS_FD_BASE 起的槽位。返回 0。
-			 * EN: service acknowledged close; release the waiter's virtual
-			 * fd slot (fd is in saved uk_regs.ebx) and return 0. */
-			int slot = (int)p->uk_regs.ebx - KVFS_FD_BASE;
-
-			if (slot >= 0 && slot < KVFS_FD_MAX)
-				p->uk_kvfs_fds[slot] = 0;
-			result = 0;
-		}
-	}
-
-	p->uk_regs.eax = (unsigned)result;
-	p->uk_kvfs_waiting = 0;
-	kvfs_waiter = 0;
-	proc_wake(p);
-	return (1);
-}
-
-/*
- * 中文：内核发起一次 /srv/ 转发：打包 srv 请求发到请求端口，登记在途事务与
- * 续传状态，保存完整 syscall 上下文后阻塞；回复由 kvfs_reply_deliver 回填。
- * 返回 TRUE 表示已阻塞并交出 CPU（恢复后从 uk_regs 继续用户态）；FALSE 表示
- * 请求入队失败（如服务端口无属主），调用方需自行在 r->eax 写错误码。
- * EN: Issue one /srv/ forward: pack the srv request to the request port,
- * register the in-flight transaction and resume state, save the full syscall
- * context and block; the reply is completed by kvfs_reply_deliver.  Returns
- * TRUE if blocked (execution resumes in user mode via uk_regs); FALSE if the
- * send failed, in which case the caller writes the error into r->eax.
- */
-static int
-kvfs_forward(struct sysregs *r, unsigned op, unsigned handle,
-    unsigned buf, unsigned arg, unsigned len,
-    const void *payload, unsigned payload_len)
-{
-	struct ipc_msg m;
-	struct srv_args_kernel *a = (struct srv_args_kernel *)m.inline_data;
-	struct process *p = cur;
-	int n;
-
-	if (kvfs_waiter != 0)
-		return (0);		/* 已有在途事务（不应发生）: caller -> EBUSY */
-	/* 服务未启动/已退出：直接返回，调用方写 -EIO（故障隔离）。
-	 * Service absent/gone: return so the caller yields -EIO. */
-	if (port_owner(SRV_PORT_KERNEL) == 0)
-		return (0);
-
-	memset(&m, 0, sizeof(m));
-	m.type = op;
-	a->handle = handle;
-	a->arg = arg;
-	m.len = sizeof(struct srv_args_kernel);
-	if (payload != 0 && payload_len > 0) {
-		if (payload_len > SRV_DATA_MAX_KERNEL)
-			payload_len = SRV_DATA_MAX_KERNEL;
-		bcopy(payload, m.inline_data + sizeof(struct srv_args_kernel),
-		    payload_len);
-		m.len += payload_len;
-	}
-	/* 会合优先：若 fs_server 正阻塞在 ipc_recv(端口0)，直接投递并唤醒，
-	 * 避免"入队但对方已从 proc_sched 恢复、不再读队列"竞态。
-	 * Rendezvous first: if fs_server is blocked in ipc_recv(port 0),
-	 * deliver directly to avoid the queue-vs-resume race. */
-	if (ipc_deliver_waiter(SRV_PORT_KERNEL, &m))
-		goto registered;
-	n = ipc_send(SRV_PORT_KERNEL, &m);
-	if (n < 0)
-		return (0);		/* 服务端口无属主等；调用方写 -EIO */
-
-registered:
-
-	/* 登记在途事务：完整 syscall 上下文存 uk_regs，回复回填参数存 uk_* */
-	p->uk_regs = *r;
-	p->uk_kvfs_waiting = 1;
-	p->uk_kvfs_op = op;
-	p->uk_kvfs_buf = buf;
-	p->uk_kvfs_len = len;
-	p->uk_kvfs_handle = handle;
-	kvfs_waiter = p;
-	kthread_block_tcb(0);
-	proc_sched();
-	/* 唤醒后从 uk_regs 恢复用户态，不会执行到这里 */
-	return (1);
-}
 
 /*
  * Hand pending data to a reader blocked inside read().  The copy happens in
@@ -6271,30 +6082,9 @@ bsd45_syscall(struct sysregs *r)
 	case 4: {			/* write(fd, buf, len) */
 		unsigned fd = r->ebx, buf = r->ecx, len = r->edx;
 		unsigned i;
-		int khandle;
 
 		if (!user_ok(buf, len)) {
 			r->eax = (unsigned)-EFAULT;
-			break;
-		}
-		/* KVFS: /srv/ virtual fd -> forward SRV_WRITE.  Copy user data into
-		 * a kernel stack buffer first (the IPC payload must be kernel VA). */
-		khandle = kvfs_fd_handle(cur, (int)fd);
-		if (khandle >= 0) {
-			char kbuf[SRV_DATA_MAX_KERNEL];
-			unsigned n = len;
-
-			if (n > SRV_DATA_MAX_KERNEL)
-				n = SRV_DATA_MAX_KERNEL;
-			if (n > 0 && ucopyin((void *)buf, kbuf, n) < 0) {
-				r->eax = (unsigned)-EFAULT;
-				break;
-			}
-			if (kvfs_forward(r, SRV_WRITE_KERNEL, (unsigned)khandle,
-			    0, n, 0, kbuf, n)) {
-				break;		/* blocked; resumed via uk_regs */
-			}
-			r->eax = (unsigned)-EIO;
 			break;
 		}
 		if (fd >= NFD) {
@@ -6447,7 +6237,6 @@ bsd45_syscall(struct sysregs *r)
 	case 3: {			/* read(fd, buf, len) */
 		unsigned fd = r->ebx, buf = r->ecx, len = r->edx;
 		unsigned i = 0;
-		int khandle;
 
 		if (!user_ok_w(buf, len)) {
 			r->eax = (unsigned)-EFAULT;
@@ -6455,17 +6244,6 @@ bsd45_syscall(struct sysregs *r)
 		}
 		if (len == 0) {
 			r->eax = 0;
-			break;
-		}
-		/* KVFS: /srv/ virtual fd -> forward SRV_READ.  The reply callback
-		 * copies data into buf and returns the byte count. */
-		khandle = kvfs_fd_handle(cur, (int)fd);
-		if (khandle >= 0) {
-			if (kvfs_forward(r, SRV_READ_KERNEL, (unsigned)khandle,
-			    buf, len, len, 0, 0)) {
-				break;		/* blocked; resumed via uk_regs */
-			}
-			r->eax = (unsigned)-EIO;
 			break;
 		}
 		if (fd >= NFD || !cur->uk_fds[fd].used) {
@@ -6757,21 +6535,6 @@ bsd45_syscall(struct sysregs *r)
 			r->eax = (unsigned)-EFAULT;
 			break;
 		}
-		/* KVFS: /srv/ prefix -> forward SRV_OPEN to user-space fs_server.
-		 * The reply callback registers a virtual fd as the return value.
-		 * KVFS: /srv/ 前缀 -> 把 SRV_OPEN 转发给用户态 fs_server；回复回调
-		 * 登记虚拟 fd 作为返回值。 */
-		if (strncmp(path, "/srv/", 5) == 0) {
-			const char *name = path + 5;
-			unsigned nlen = strlen(name) + 1;
-
-			if (kvfs_forward(r, SRV_OPEN_KERNEL, 0, 0, 0, 0,
-			    name, nlen)) {
-				break;		/* blocked; resumed via uk_regs */
-			}
-			r->eax = (unsigned)-EIO;	/* 服务端口无属主 / 已有在途事务 */
-			break;
-		}
 		/* S11: the three character devices live outside the VFS */
 		if (strcmp(path, "/dev/null") == 0 ||
 		    strcmp(path, "/dev/zero") == 0 ||
@@ -6844,23 +6607,6 @@ bsd45_syscall(struct sysregs *r)
 		break;
 	}
 	case 6: {			/* close(fd) */
-		int khandle = kvfs_fd_handle(cur, (int)r->ebx);
-
-		if (khandle >= 0) {
-			/* KVFS: /srv/ virtual fd -> forward SRV_CLOSE to fs_server.
-			 * Full transparent forwarding like open/read/write: the reply
-			 * callback (kvfs_reply_deliver) releases the virtual fd slot and
-			 * writes eax=0, then wakes us.  Service absent -> -EIO.
-			 * KVFS: /srv/ 虚拟 fd -> 把 SRV_CLOSE 完整转发给 fs_server，
-			 * 与 open/read/write 一样走阻塞转发；回复回调释放虚拟 fd 槽位、
-			 * 写 eax=0 并唤醒。服务不在 -> -EIO。 */
-			if (kvfs_forward(r, SRV_CLOSE_KERNEL, (unsigned)khandle,
-			    0, 0, 0, 0, 0)) {
-				break;		/* blocked; resumed via uk_regs */
-			}
-			r->eax = (unsigned)-EIO;	/* 服务端口无属主 / 已有在途事务 */
-			break;
-		}
 		/* §7.2.1 item 7: the teardown runs without the BKL. */
 		/* 中文：§7.2.1 第 7 条：拆除过程不持 BKL。 */
 		fd_close_common((int)r->ebx, 1);
@@ -7851,15 +7597,6 @@ bsd45_syscall(struct sysregs *r)
 		}
 		bcopy((void *)r->ecx, &m, sizeof(m));
 		m.from = (unsigned)cur->uk_pid;	/* 内核填发送方 pid */
-		/* 中文：KVFS 回复优先——fs_server 把回复发到端口1 时，若有内核
-		 * 转发事务在途，直接回填等待者并唤醒，不入回复队列。
-		 * EN: KVFS reply first - when fs_server sends a reply to port 1
-		 * and a kernel forwarding transaction is in flight, complete the
-		 * waiter directly and wake it, bypassing the reply queue. */
-		if (kvfs_reply_deliver(r->ebx, &m)) {
-			r->eax = 0;
-			break;
-		}
 		/* 中文：会合优先——若有人阻塞在 recv，直接投递并唤醒，不入队。
 		 * EN: rendezvous first - if someone is blocked in recv, deliver
 		 * directly and wake them, bypassing the queue. */

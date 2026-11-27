@@ -126,7 +126,6 @@
 | `kernel/obj/`、`kernel/other/` | **已删除/合并** | 内容并入 `lib/`、`sys/` |
 | `bsd45/src/`（原始 tarball 解包树） | **已删除** | 已合并进 kernel/libc，构建不需要 tarball |
 | 完整 SMP | **部分实现** | AP 上线 / 每核 TSS / 多核用户调度已可用；`smpuser` 默认关，见 `os_smp.md` §5.2 |
-| `microkernel/`、`monolithickernel/` | 占位/设计 | 非运行代码 |
 
 ## 快速构建
 

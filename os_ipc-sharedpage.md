@@ -1,9 +1,11 @@
 # BSD45 IPC 与共享页实现（S300：KP-4 / KP-6 / KP-7）
 
-> 本轮实现微内核化缺失的三块内核地基：`block_on/wakeup` 通用阻塞原语（KP-4）、
+> 内核里的三块底层原语：`block_on/wakeup` 通用阻塞通道（KP-4）、
 > 基于端口的 `send/recv` 消息 IPC（KP-6）、共享物理页映射（KP-7）。
-> 对应 `docs/microkernel-design.md` 第 4 节契约。
-> 默认不激活（无服务注册端口、无 syscall 调用时行为与基线一致），遵守
+> 它们是**通用内核机制**：`ipctest` 直接验证，进程间传大块数据也能用；
+> 与"把文件系统/驱动搬到用户态"没有绑定关系（那个方向已于 2026-11-28 放弃，
+> 见 `RESUME-TASK.md` §6.2.18）。
+> 默认不激活（无端口注册、无 syscall 调用时行为与基线一致），遵守
 > `asmble.md`（汇编只能在 `arch/` 下，新增代码全部为可移植 C，含中英注释）。
 
 ## 1. 实现内容
@@ -19,7 +21,7 @@
 
 - 固定 16 项端口表 `ports[]` + 每端口 4 个有界消息槽（共 64 槽）
 - `struct ipc_msg`：`from`（内核填发送方 pid）/ `type` / `len` / `pa`（共享页物理地址）/
-  `reply_port` / `inline_data[64]`——与 `microkernel-design.md` 契约一致
+  `reply_port` / `inline_data[64]`
 - 端口：`port_register` / `port_release` / `ipc_send` / `ipc_recv` / `ipc_proc_exit`
 - 语义：
   - `send` 入队并 `wakeup_one` 接收者；内核填 `from`；本身不阻塞（避免单线程自死锁）
@@ -123,20 +125,17 @@ bash tools/run_qemu_test.sh -Keys "shell|/bin/ipctest|exit 0" -WaitFor "user exi
 - `build_sh.sh` / `build_sh.ps1` —— 用户态工具列表加入 `ipctest`
 - `build_iso.sh` / `build_iso.ps1` —— 把 `/bin/IPCTEST.ELF` 打包进 ISO
 
-## 6. 与微内核化的关系
+## 6. 定位
 
-这三块是 `fs_server` / `tty_server` 上移的前置地基：
+这三块是内核里的通用机制，与用户态服务化无关：
 
-- KP-4 让未来服务能 `block_on` 等请求（复用了 S200 的 waitq）
-- KP-6 让客户端与服务端通过端口通信，`-EIO` 故障语义支撑"服务崩溃不拖死整机"
-- KP-7 让大于 64 字节的文件内容走共享页，消息只传 `pa`
+- KP-4 给任何需要睡眠等待的内核路径提供统一的 `block_on`（复用 S200 的 waitq）
+- KP-6 提供跨进程端口通信，端口无属主时 `recv` 返回 `-EIO`
+- KP-7 让大于 64 字节的数据走共享页，消息只传 `pa`
 
-下一步（未做）：在 usermode.c 补齐用户线程"保存 regs + 续传"的阻塞协议，
-把 pipe/wait 路径逐步改用 `block_on`，再把 tmpfs 拆成 `fs_server` 走 IPC。
+## 7. S400 增强：真会合阻塞
 
-## 7. S400 增强：真会合阻塞与故障隔离
-
-S300 的 IPC 地基在 S400 补齐了"真会合"语义（详见 `os_microkernel.md`）：
+S300 的 IPC 补齐了"真会合"语义（替代原来的 `-EAGAIN` 轮询）：
 
 - `kprocess.h` 新增续传字段 `uk_ipc_waiting / uk_ipc_port / uk_ipc_msguser`
 - `SYS_IPC_RECV`：队列空且端口有 owner 时，保存 regs 到 `uk_regs`、
@@ -144,8 +143,6 @@ S300 的 IPC 地基在 S400 补齐了"真会合"语义（详见 `os_microkernel.
 - `SYS_IPC_SEND`：有阻塞接收者时用 `pipe_copy` 跨进程写其用户缓冲、填
   `uk_regs.eax=0`、`proc_wake()` 直接投递，不入队
 - `ipc_fail_waiters()`：端口释放时给所有阻塞接收者写 -EIO 并唤醒，由
-  `port_release` / `ipc_proc_exit` 调用——这就是设计文档里"服务崩溃→在飞请求
-  EIO"故障隔离契约的内核实现
+  `port_release` / `ipc_proc_exit` 调用
 
-验证：`ipctest` 的跨进程会合（子进程先 recv 真阻塞、父进程 send 直接投递）PASS；
-`srvtest` 的服务退出后请求返回 -EIO 且内核无 TRAP PASS。
+验证：`ipctest` 的跨进程会合（子进程先 recv 真阻塞、父进程 send 直接投递）PASS。

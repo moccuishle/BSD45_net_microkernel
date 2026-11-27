@@ -42,10 +42,6 @@ prepare_headers() {
 	cp -f "$ws/libc/include/pthread.h" "$incu/pthread.h"
 	cp -f "$ws/libc/include/uring.h" "$incu/uring.h"
 	cp -f "$ws/libc/include/syscall_arch.h" "$incu/syscall_arch.h"
-	cp -f "$ws/libc/include/srv.h" "$incu/srv.h"
-	cp -f "$ws/libc/include/dev.h" "$incu/dev.h"
-	cp -f "$ws/libc/include/shmbuf.h" "$incu/shmbuf.h"
-	cp -f "$ws/libc/include/net.h" "$incu/net.h"
 	[ -f "$incu/errno.h" ] && return 0
 	step "preparing libc header view"
 	# Mirror build_sh.ps1 exactly: 4.5BSD usr/include, sys/sys (also at the
@@ -358,8 +354,7 @@ if [ "$target" = "sh" ]; then
 	tools=(echo ls cat mkdir kill sleep rm cp mv wc grep head tail df mount
 	       ps uname true false date vmstat mmaptest subtest pthread schedtest
 	       pthpreempt pthmain aiotest rdstress uring spin cowtest crash badptr ipctest
-	       fs_server srvtest devfs_server devtest shmtest vfstest proctest
-	       netsrv nettest)
+	       proctest)
 	for tool in "${tools[@]}"; do
 		tobj="$obj/$tool.o"
 		compile_c "$ws/libexec/$tool.c" "$tobj" || continue
