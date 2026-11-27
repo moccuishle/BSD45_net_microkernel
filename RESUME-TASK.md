@@ -1109,7 +1109,7 @@ arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效*
 | 编译（`build_all.sh` + `build_iso.ps1`） | ✅ 通过，`out/BSD45-ELF-x86.iso` 07:38 生成 |
 | 26 套验收 `tools/all_tests.sh` | ✅ **24 PASS + 2 已知失效**（`test_subsys`/`test_ipl`，与改动前逐套一致，无新增失败） |
 | 8 核 3 GB 复现验证 | ❌ **未完成**——这是唯一缺口，见 §7.0.1 |
-| 上库（主仓 + 4 镜像） | ⏳ **文档与补丁已上库**（`ade629d`，5 仓树 `71a2a5c`）；**代码改动仍未进 main**，等 8 核验证通过 |
+| 上库（主仓 + 4 镜像） | ⏳ **文档与补丁已上库**（`ade629d` 起，含本次补全）；**代码改动仍未进 main**，等 8 核验证通过 |
 
 **8 核验证为什么没跑完**：两次尝试都报废在测试台而非内核上。
 `aioA` 那轮 `qdrive.py` 没把 QEMU 拉起来（日志停在 `# ` 提示符、QEMU 进程
@@ -1246,7 +1246,6 @@ bash tools/all_tests.sh
 
 ```sh
 export PATH=/c/msys64/ucrt64/bin:$PATH MSYS_NO_PATHCONV=1
-cd bsd45
 rm -f C:/tmp/aioA.log C:/tmp/aioB.log
 python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 \
     --timeout 620 --log C:/tmp/aioA.log \
@@ -1254,6 +1253,8 @@ python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 \
     --cmd "/bin/pthread+40" --cmd "/bin/pthmain+35" --cmd "/bin/pthpre+35" \
     --cmd "/bin/aiotest+50" --cmd "/bin/aiotest+50" --cmd ps --cmd "exit 0"
 ```
+
+（当前目录仍是步骤 1 的 `bsd45/`，不要再 `cd bsd45`。）
 
 通过后**把 log 改成 `aioB` 原样再跑一轮**（两轮都要过；改动前同一序列的挂起
 概率约 1/2，见 §6.2.20）。
