@@ -1109,7 +1109,7 @@ arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效*
 | 编译（`build_all.sh` + `build_iso.ps1`） | ✅ 通过，`out/BSD45-ELF-x86.iso` 07:38 生成 |
 | 26 套验收 `tools/all_tests.sh` | ✅ **24 PASS + 2 已知失效**（`test_subsys`/`test_ipl`，与改动前逐套一致，无新增失败） |
 | 8 核 3 GB 复现验证 | ❌ **未完成**——这是唯一缺口，见 §7.0.1 |
-| 上库（主仓 + 4 镜像） | ❌ 未做（等 8 核验证通过后再提） |
+| 上库（主仓 + 4 镜像） | ⏳ **文档与补丁已上库**（`ade629d`，5 仓树 `71a2a5c`）；**代码改动仍未进 main**，等 8 核验证通过 |
 
 **8 核验证为什么没跑完**：两次尝试都报废在测试台而非内核上。
 `aioA` 那轮 `qdrive.py` 没把 QEMU 拉起来（日志停在 `# ` 提示符、QEMU 进程
@@ -1277,13 +1277,27 @@ python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem 3072 --smp 8 \
 
 #### 步骤 5：上库（5 仓同步，见 §7.0 第 5 条）
 
+4 个镜像的 remote 已在仓库里配好，名字是 `alloc` / `dev` / `net` / `mk`
+（`alloc`=`BSD45_multiprocess_allocation`、`dev`=`BSD45_device_microkernel`、
+`net`=`BSD45_net_microkernel`、`mk`=`BSD45_microkernel`）。新机器若没有，
+按 §0.4 的表补 `git remote add` 即可。
+
 ```sh
 git add bsd45/kernel/sys/usermode.c
 git rm docs/patches/S432-aio-wakeup.patch      # 代码进 main 后补丁即失效
 git commit -m "S432: close the aio completion race and pin requeues to the owner CPU"
 git push origin main
-# 4 个镜像：commit-tree $(git rev-parse HEAD^{tree}) -p <remote>/main → push
-git fetch && 校验 5 棵树一致
+
+TREE=$(git rev-parse HEAD^{tree}); MSG=$(git log -1 --format=%B)
+for r in alloc dev net mk; do
+    git fetch -q $r main
+    C=$(git commit-tree $TREE -p $r/main -m "$MSG")
+    git push -q $r $C:refs/heads/main
+done
+for r in origin alloc dev net mk; do
+    git fetch -q $r main
+    git rev-parse --short $r/main^{tree}     # 5 行必须同一个树号
+done
 ```
 
 提交说明的要点（照抄即可）：两处独立的丢唤醒——aio 的"检查后阻塞"竞态、调度
