@@ -692,6 +692,33 @@ Windows 上全套验收从 **5m33s → 59s**，三条做法都不改任何判定
 判读：并行后单套时间略增（争 CPU），整体墙钟降约 75%；结果与串行基线逐套
 一致（24 PASS + 2 已知失效）。
 
+### 6.2.12 P2 第六步：/dev 伪文件读缓冲加锁（2026-11-28）
+
+按 §7.2.1 第 3 条给 `/dev` 伪文件加锁。**这一条只加锁、不摘 BKL**——不是
+保守，而是这里有一条硬性的锁序限制，值得写清楚：
+
+- **为什么不能顺手摘 BKL**：`read` 的模板是"先放内层锁，再 `smp_bkl_enter()`"。
+  但 `/dev` 的渲染必须和拷贝一起被保护（否则缓冲会被另一个读者覆盖），即
+  `devbuf_lock` 必须跨越"渲染 → 拷贝"。而**跨 `smp_bkl_enter()` 持锁**就构成
+  `BKL -> devbuf_lock` 的反转：A 核持 `devbuf_lock` 等 BKL，B 核持 BKL 等
+  `devbuf_lock` ——正是 S422 的"时钟静止"死锁。所以只要还用文件级静态缓冲，
+  这条路径就不能离开 BKL。
+- **`devbuf_lock`** 保护 `ps_snap_buf`/`ps_snap_len`（`/dev/ps`）、
+  `mbuf`/`mlen`（`/dev/mounts`）、`vbuf`（`/dev/vmstat`）。三条分支统一写成
+  "锁内渲染 + 锁内 `bcopy` 到用户 + 锁内提交 offset + 放锁后 `r->eax = n2`"，
+  避免在锁内 `break`（原来的 `break` 会漏解锁）。
+- **`FD_NULL`/`FD_ZERO` 不加锁**：它们不碰静态缓冲（null 直接返回 0，zero
+  直接写用户页），没有需要保护的共享状态。
+- **要真正让 `/dev/ps` 离开 BKL 的办法**（后续可选）：把渲染改成**每次调用
+  自己的缓冲**——`/dev/mounts`（256B）、`/dev/vmstat`（512B）可以直接放栈上，
+  那样就不需要 `devbuf_lock`，也就可以安全地 `smp_bkl_drop()`；
+  `/dev/ps` 的 32KB 快照放不进 16KB 内核栈，需要一个小的页池或按行流式输出。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**；`test_ps`/
+`test_mount`/`test_cache`/`test_tools` 单独 PASS；8 核 3 GB 基线
+`pthread`/`pthmain`/`pthpre`/`aiotest` 全过，**0 TRAP / triple fault /
+STACK OVERFLOW / address space busy**，`ps` 正常，`exit 0` 干净退出。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -834,9 +861,10 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    已建立"两条路径离开 BKL"的模板。
 2. **`fstat` / `stat`** ✅ `fstat` 已完成（§6.2.10）：只读 vnode 的 `getattr`，
    vnode 由 `vfs_lock` 保护；`stat` 仍走 namei，**尚未摘**。
-3. **`/dev` 伪文件 read**：`FD_ZERO`/`FD_NULL`/`FD_VMSTAT`/`FD_MOUNTS`/
-   `FD_PS`。它们的输出落在文件作用域静态缓冲（`ps_snap_buf`、`mbuf`、
-   `vbuf`），**必须先加一把 `devbuf_lock`**，否则两个进程同时读会互相踩。
+3. **`/dev` 伪文件 read** ✅ 已加锁（§6.2.12）：`FD_ZERO`/`FD_NULL`/`FD_VMSTAT`/
+   `FD_MOUNTS`/`FD_PS`，新增 `devbuf_lock` 保护文件级静态缓冲（`ps_snap_buf`、
+   `mbuf`、`vbuf`）。**未摘 BKL**：跨 `smp_bkl_enter()` 持 `devbuf_lock` 会
+   反转锁序造成 S422 型死锁；要摘需先把渲染改成每次调用自己的缓冲。
 4. **tmpfs 文件 read/write**：`FD_TMPFILE` 直接读写 `tmpfs[].data`，要先给
    tmpfs 节点加锁（或在 `pagecache_purge_vp` 之外引入节点锁），别忘了
    `n->size` 与 `data` 的分配是分开的两步。

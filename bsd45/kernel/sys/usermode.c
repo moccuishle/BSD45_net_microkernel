@@ -195,6 +195,10 @@ static struct file ramfs[] = {
 static char	ps_snap_buf[32768];
 static int	ps_snap_len;
 
+/* 中文：P2 /dev 伪文件读缓冲锁：ps_snap_buf / mbuf / vbuf 都是文件作用域静态量，两个进程同时读 /dev/ps、/dev/mounts 或 /dev/vmstat 会互相踩。只保护这些缓冲和渲染/拷贝，不跨后端、不等 BKL。 */
+/* EN: P2 /dev pseudo-file buffer lock: ps_snap_buf / mbuf / vbuf are file-scope statics, so two processes reading /dev/ps, /dev/mounts or /dev/vmstat at once would stomp each other. Guards only these buffers + render/copy, never a backend, never the BKL. */
+static struct spinlock devbuf_lock;
+
 /*
  * S17: mmap(2).  This port has no demand paging (a page fault stops the
  * machine), so mappings are populated eagerly:
@@ -3745,6 +3749,7 @@ proc_table_init(void)
 	spin_init(&page_lock);
 	spin_init(&pipe_lock);
 	spin_init(&fd_lock);
+	spin_init(&devbuf_lock);
 	procs = (struct process *)kern_table_alloc((unsigned)PROC_TABLE_VA,
 	    (unsigned)NPROC * (unsigned)sizeof(struct process));
 	printf("usermode: %d proc slots at %x (%d KB)\n", NPROC,
@@ -6297,18 +6302,29 @@ bsd45_syscall(struct sysregs *r)
 			 */
 			unsigned off = cur->uk_fds[fd].off, n2;
 
+			/*
+			 * §7.2.1 item 3: ps_snap_buf/ps_snap_len are file-scope
+			 * statics, so serialise them with devbuf_lock.  The BKL is
+			 * NOT dropped here on purpose: holding devbuf_lock across
+			 * smp_bkl_enter() would invert the BKL -> devbuf_lock
+			 * order (a sibling that already holds the BKL may spin on
+			 * devbuf_lock), which is the S422 deadlock pattern.
+			 * 中文：ps_snap_buf 是文件级静态量，用 devbuf_lock 串行化。此处刻意不摘 BKL——若持锁跨越 smp_bkl_enter()，会反转 BKL -> devbuf_lock 次序（已持 BKL 的兄弟核可能正等 devbuf_lock），正是 S422 的死锁形态。
+			 */
+			spin_lock(&devbuf_lock);
 			if (off == 0)
 				ps_snap_len = proc_list_text(ps_snap_buf,
 				    sizeof(ps_snap_buf));
-			if (off >= (unsigned)ps_snap_len) {
-				r->eax = 0;
-				break;
+			if (off >= (unsigned)ps_snap_len)
+				n2 = 0;
+			else {
+				n2 = ps_snap_len - off;
+				if (n2 > len)
+					n2 = len;
+				bcopy(ps_snap_buf + off, (char *)buf, n2);
+				cur->uk_fds[fd].off = off + n2;
 			}
-			n2 = ps_snap_len - off;
-			if (n2 > len)
-				n2 = len;
-			bcopy(ps_snap_buf + off, (char *)buf, n2);
-			cur->uk_fds[fd].off = off + n2;
+			spin_unlock(&devbuf_lock);
 			r->eax = n2;
 			break;
 		}
@@ -6324,18 +6340,24 @@ bsd45_syscall(struct sysregs *r)
 			 * the start of each read sequence.
 			 * 与 /dev/ps 同样的 S409 修复：旧代码 `static int mlen = -1`
 			 * 把首次挂载表缓存到关机，mount(8) 之后 df 仍显示旧列表。
+			 *
+			 * §7.2.1 item 3: mbuf/mlen are statics -> devbuf_lock.
+			 * BKL stays held for the same lock-order reason as /dev/ps.
+			 * 中文：mbuf/mlen 为静态量，用 devbuf_lock 串行化；与 /dev/ps 同因，BKL 不摘。
 			 */
+			spin_lock(&devbuf_lock);
 			if (off == 0)
 				mlen = vfs_mount_list(mbuf, sizeof(mbuf));
-			if (off >= (unsigned)mlen) {
-				r->eax = 0;
-				break;
+			if (off >= (unsigned)mlen)
+				n2 = 0;
+			else {
+				n2 = mlen - off;
+				if (n2 > len)
+					n2 = len;
+				bcopy(mbuf + off, (char *)buf, n2);
+				cur->uk_fds[fd].off = off + n2;
 			}
-			n2 = mlen - off;
-			if (n2 > len)
-				n2 = len;
-			bcopy(mbuf + off, (char *)buf, n2);
-			cur->uk_fds[fd].off = off + n2;
+			spin_unlock(&devbuf_lock);
 			r->eax = n2;
 			break;
 		}
@@ -6345,18 +6367,26 @@ bsd45_syscall(struct sysregs *r)
 			 * read instead of caching a snapshot like /dev/ps.
 			 */
 			static char vbuf[512];
-			int vlen = vfs_cache_report(vbuf, sizeof(vbuf));
+			int vlen;
 			unsigned off = cur->uk_fds[fd].off, n2;
 
-			if (off >= (unsigned)vlen) {
-				r->eax = 0;
-				break;
+			/*
+			 * §7.2.1 item 3: vbuf is a static -> devbuf_lock.
+			 * BKL stays held (same lock-order reason as /dev/ps).
+			 * 中文：vbuf 为静态量，用 devbuf_lock 串行化；BKL 不摘（同 /dev/ps 的锁序原因）。
+			 */
+			spin_lock(&devbuf_lock);
+			vlen = vfs_cache_report(vbuf, sizeof(vbuf));
+			if (off >= (unsigned)vlen)
+				n2 = 0;
+			else {
+				n2 = vlen - off;
+				if (n2 > len)
+					n2 = len;
+				bcopy(vbuf + off, (char *)buf, n2);
+				cur->uk_fds[fd].off = off + n2;
 			}
-			n2 = vlen - off;
-			if (n2 > len)
-				n2 = len;
-			bcopy(vbuf + off, (char *)buf, n2);
-			cur->uk_fds[fd].off = off + n2;
+			spin_unlock(&devbuf_lock);
 			r->eax = n2;
 			break;
 		}
