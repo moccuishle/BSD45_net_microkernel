@@ -26,6 +26,34 @@ struct cpu_info cpus[MAXCPU];
 int ncpu = 1;			/* BSP is CPU 0; grows as APs come up */
 static int ap_tramp_installed = 0;	/* set once trampoline is copied+patched */
 
+/*
+ * S432: cpu_id() moved here from sys/smp.h, where it was a static __inline
+ * that executed `str` directly.  asmble.md forbids assembly outside arch/,
+ * so the instruction now lives in the i386 tree and the generic header only
+ * declares the function.  Callers are unchanged.
+ *
+ * `str` has a 16-bit destination, so the upper half of the register GCC
+ * picks is undefined afterwards.  Mask explicitly: relying on the compiler
+ * to zero-extend gave an AP a garbage CPU id now and then (it then wrote the
+ * BSP's TSS esp0 and both CPUs shared a kernel stack).
+ * S432：cpu_id() 从 sys/smp.h 移到本文件（原先是内联 `str`）。asmble.md 禁止
+ * arch/ 之外出现汇编，因此指令归 i386 目录，通用头只留声明，调用点不变。
+ * `str` 是 16 位目标，寄存器高 16 位未定义，必须显式掩码；否则偶尔会算出
+ * 垃圾 CPU 号（曾导致 AP 改写 BSP 的 TSS esp0，两核共用栈）。
+ */
+int
+cpu_id(void)
+{
+	unsigned sel = 0;
+
+	__asm __volatile("str %0" : "=r" (sel));
+	sel &= 0xffffu;
+	sel >>= 3;
+	if (sel < CPU_TSS_SEL_BASE || sel >= CPU_TSS_SEL_BASE + MAXCPU)
+		return (0);
+	return ((int)(sel - CPU_TSS_SEL_BASE));
+}
+
 /* S412: IPI gates.  setidt() lives in machdep.c (K&R definition). */
 extern void setidt(int idx, void *func, int typ, int dpl);
 extern void smp_ipi_tlb(void), smp_ipi_resched(void), smp_ipi_stop(void);

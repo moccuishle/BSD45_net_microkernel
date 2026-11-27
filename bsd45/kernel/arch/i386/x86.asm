@@ -100,6 +100,25 @@ _cpu_sti:
 	sti
 	ret
 
+/*
+ * void cpu_idle(void) - enable interrupts and stop until the next one.
+ *
+ * S432: the scheduler's idle loop used to spell this out as
+ * `__asm __volatile("sti; hlt")` in kernel/sys/usermode.c, which asmble.md
+ * forbids.  The pair must stay a single routine: an interrupt arriving
+ * between an sti and a hlt would otherwise be serviced and then the CPU
+ * would sleep through the following tick.
+ * S432：调度器空闲循环原先在 kernel/sys/usermode.c 里内联 `sti; hlt`，
+ * 违反 asmble.md。两者必须成对且不可分割——若中断落在 sti 与 hlt 之间，
+ * 处理完就会一直睡到再下一个时钟。
+ */
+	.globl	_cpu_idle
+	.align	4
+_cpu_idle:
+	sti
+	hlt
+	ret
+
 /* unsigned cpu_read_esp(void) */
 	.globl	_cpu_read_esp
 	.align	4

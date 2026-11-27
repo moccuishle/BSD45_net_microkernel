@@ -1003,6 +1003,65 @@ AIO-tr: scan p=1 state=2 wtok=1 want=1 ← 进程在、状态 P_BLOCKED、token 
 （`all_tests.sh` 的清单里没有 `test_s400`/`test_device`/`test_net`），默认启动
 路径走的是内核 VFS 与 `/dev` 分支。§6.2.17 的 8 核基线在改动前后逐项一致。
 
+### 6.2.19 把 kernel 下的 x86 汇编全部收进 arch/（2026-11-28）
+
+**要求**：`kernel/` 下除 `arch/` 外，任何文件都不得含汇编内容。
+
+**审计结果**：独立汇编文件早在 2026-11-20 就迁完了（`find` 为空），漏的是
+**内联汇编**——它们不在 `arch/` 之外的文件里，而在通用头文件的 `static
+__inline` 里，`find` 审计永远看不见：
+
+| 位置 | 指令 | 为什么危险 |
+|---|---|---|
+| `include/sys/smp.h` `cpu_id()` | `str %0` | 被 62 处调用，是 `curk` 宏的基础 |
+| `include/sys/smp.h` `atomic_cmpxchg()` | `lock; cmpxchgl` | 与 `arch/i386/atomic.c` 里的同名函数**重复定义**，谁生效取决于包含顺序 |
+| `include/sys/smp.h` `atomic_xchg()` | `xchgl` | 同上（arch 里叫 `atomic_test_and_set`） |
+| `include/sys/smp.h` `atomic_add()` | `lock; xaddl` | 同上，且返回**旧值**，与 arch 版（返回新值）语义相反 |
+| `sys/usermode.c` `page_ref_add()` | `lock; xaddw` | 16 位 COW 引用计数，唯一的 16 位原子原语 |
+| `sys/usermode.c` 空闲循环 | `sti; hlt` | 关中断/开中断配对，拆开就会睡过下一个时钟 |
+
+真正的问题不只是"规则没守"，而是**同名函数两份实现语义不同**：`smp.h` 的
+`atomic_add()` 返回加之前的值，`arch/i386/atomic.c` 的返回加之后的值。哪个被
+调用取决于该编译单元里 `smp.h` 和 `atomic.h` 的包含顺序——这不是风格问题，
+是随时会咬人的地雷。
+
+**改动**（汇编全部搬进 `arch/i386/`，通用侧只剩声明和调用）：
+
+1. `arch/i386/smp.c`：新增 `cpu_id()`，`str` 连同"高 16 位必须掩码"的注释一起
+   搬过来；`sys/smp.h` 只留 `int cpu_id(void);`。
+2. `arch/i386/atomic.h` / `atomic.c`：补齐并统一命名——
+   `atomic_add()` 返回**新值**、`atomic_fetch_add()` 返回**旧值**、
+   `atomic_cmpxchg()` 返回旧值、`atomic_xchg()` 取代原来的
+   `atomic_test_and_set()`（同名同语义，仅改名）、新增
+   `atomic_xadd16(unsigned short *, int)` 承接 COW 引用计数。
+3. `arch/i386/x86.asm`：新增 `cpu_idle`（`sti; hlt; ret`）；`io.h` 加声明；
+   `arch/i386/ctx.c` 加 `hal_cpu_idle()` 包装，`sys/platform.h` 加原型——
+   与既有的 `hal_cpu_halt()` 同层。
+4. `sys/usermode.c`：`page_ref_add()` 改调 `atomic_xadd16()`；空闲循环改调
+   `hal_cpu_idle()`；三处 `atomic_add()` 改 `atomic_fetch_add()`
+   （`sched_switches` 一处、`next_pid` 两处），**PID 分配顺序逐字节不变**。
+5. `sys/sync.h`：删掉那段 `#if defined(ARCH_i386) #include ...` 的架构选择，
+   移到 `sys/smp.h`——`kthread.c` 也要用原子而它已经包含 `smp.h`，
+   这样全树只在一处做 ARCH 选择。
+6. `tools/check-asm.sh`（新增）：两类违规一起查（汇编文件 + 内联汇编），
+   退出码 0/1/2，输出包含"把指令搬进 arch/ 并只留原型"的修复提示。
+7. `asmble.md`：规则从"只管 `.s/.S/.asm` 后缀"改成"汇编代码一律不得出现在
+   `arch/` 之外，含内联汇编与空汇编屏障"；补 2026-11-28 整改记录、
+   合规清单、检查命令；明确"通用头可以留原型，但不得有 `__asm`"。
+
+**没有改构建脚本**：本次没有新增/删除编译单元——`atomic.c`、`smp.c` 本来就在
+`arch/i386/config.mk` 的源列表里，`x86.asm` 也早已加入汇编列表。
+
+**验证**：`bash tools/check-asm.sh` → `PASS`（arch 下 14 个汇编源，
+arch 外 0 个文件 / 0 处内联）；26 套验收 **24 PASS + 2 已知失效**
+（`test_subsys`/`test_ipl`，与基线逐套一致，wall 61s）；8 核 3 GB 基线
+`rdstress`/`pthread`/`pthmain`/`pthpre`/`aiotest` 全 PASS、0 TRAP、`exit 0`。
+
+**顺带说明**：`include/i386/`、`include/machine/` 这两个机器相关头目录仍在
+`arch/` 之外，但它们只有 `ansi.h`/`limits.h`/`float.h`/`profile.h`/`pmap.h`
+等**纯宏与类型定义**，没有指令，不属本次范围；将来若真要支持第二种架构，
+这两个目录应该一起并入 `arch/<arch>/include/`。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端

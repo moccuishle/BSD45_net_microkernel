@@ -1079,27 +1079,24 @@ page_ref_get(unsigned pa)
  * than one CPU now (a fork on CPU A bumps the count while the other process
  * on CPU B drops it in exit), and a plain ++ compiles to load/add/store, so
  * two CPUs could lose an increment and page_put() would then free a page
- * that is still mapped.  `lock xaddw` is one instruction and returns the old
- * value, which is what the "am I the last user" decision needs.
+ * that is still mapped.
+ * S432: the `lock xaddw` that used to be inlined here moved to
+ * arch/i386/atomic.c (atomic_xadd16) - asmble.md keeps all assembly under
+ * arch/.  Same instruction, same "returns the old value" contract, which is
+ * what the "am I the last user" decision below needs.
  * 16 位原子加。引用计数现在会被多个 CPU 触碰（A 核 fork 时加，B 核 exit 时减），
  * 普通 ++ 会编译成 load/add/store，两个 CPU 可能丢掉一次自增，page_put() 就会
- * 释放仍在映射的页。`lock xaddw` 一条指令并返回旧值，正是"我是不是最后一个"
- * 所需的语义。
+ * 释放仍在映射的页。S432：原先内联在这里的 `lock xaddw` 移到
+ * arch/i386/atomic.c（atomic_xadd16），语义不变——仍返回旧值。
  */
 static unsigned
 page_ref_add(unsigned pa, int delta)
 {
 	unsigned i = page_index(pa);
-	unsigned short d;
 
 	if (i == 0)
 		return (0);
-	d = (unsigned short)delta;
-	__asm __volatile("lock; xaddw %0,%1"
-	    : "+r" (d), "+m" (page_ref[i])
-	    :
-	    : "memory");
-	return ((unsigned)d);		/* the value before the add */
+	return ((unsigned)atomic_xadd16(&page_ref[i], delta));
 }
 
 /* 中文：递增物理页的 COW 引用计数（原子），超出表范围则忽略 */
@@ -4069,7 +4066,18 @@ proc_sched(void)
 				if (cid == 0)
 					smp_print();
 			}
-			__asm __volatile("sti; hlt");
+			/*
+			 * S432: `sti; hlt` used to be inlined here; it is now
+			 * hal_cpu_idle() -> cpu_idle() in arch/i386/x86.asm,
+			 * because asmble.md allows assembly only under arch/.
+			 * The pair must not be split: an interrupt taken
+			 * between sti and hlt would be serviced and the CPU
+			 * would then sleep through the following tick.
+			 * S432：原内联的 `sti; hlt` 改为 hal_cpu_idle()（汇编在
+			 * arch/i386/x86.asm）。二者不可拆开，否则中断落在中间时
+			 * 处理完会一直睡到再下一个时钟。
+			 */
+			hal_cpu_idle();
 			continue;
 		}
 		printf("\n[no runnable process]\n");
@@ -4583,7 +4591,7 @@ sched_tick(struct sysregs *r)
 	sched_cpu[cpu_id()].sc_prev = me;
 	sched_cpu[cpu_id()].sc_parked = 0;
 	hal_intr_user_resume(r);
-	(void)atomic_add((volatile int *)&sched_switches, 1);
+	(void)atomic_fetch_add((volatile int *)&sched_switches, 1);
 	sched_cpu[cpu_id()].sc_switches++;
 }
 
@@ -4604,7 +4612,7 @@ do_fork(struct sysregs *r)
 	}
 	hal_address_space_activate(cur->uk_pd);		/* flush the parent's stale writable TLBs */
 	p->uk_state = P_RUN;
-	p->uk_pid = atomic_add(&next_pid, 1);
+	p->uk_pid = atomic_fetch_add(&next_pid, 1);
 	p->uk_ppid = cur->uk_pid;
 	p->uk_pd = pd;
 	(void)proc_add_thread(p, p->uk_pid);	p->uk_p_next_tid = TID_USER_BASE + p->uk_pid * TID_STRIDE;
@@ -4677,7 +4685,7 @@ do_vfork(struct sysregs *r)
 	}
 	hal_address_space_activate(cur->uk_pd);
 	p->uk_state = P_RUN;
-	p->uk_pid = atomic_add(&next_pid, 1);
+	p->uk_pid = atomic_fetch_add(&next_pid, 1);
 	p->uk_ppid = cur->uk_pid;
 	p->uk_pd = pd;
 	(void)proc_add_thread(p, p->uk_pid);

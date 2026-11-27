@@ -42,27 +42,17 @@
 #define	CPU_TSS_SEL_BASE	6	/* must match GPROC0_SEL in machdep.c */
 
 #ifndef ASSEMBLER
-static __inline int
-cpu_id(void)
-{
-	unsigned sel = 0;
-
-	/*
-	 * `str` has a 16-bit destination, so the upper half of the register
-	 * GCC picked is undefined afterwards.  Mask explicitly: relying on
-	 * the compiler to zero-extend gave an AP a garbage CPU id now and
-	 * then (it then wrote the BSP's TSS esp0 and both CPUs shared a
-	 * kernel stack).
-	 * `str` 是 16 位目标，寄存器高 16 位是未定义的，必须显式掩码；否则
-	 * 偶尔会算出垃圾 CPU 号（曾导致 AP 改写 BSP 的 TSS esp0，两核共用栈）。
-	 */
-	__asm __volatile("str %0" : "=r" (sel));
-	sel &= 0xffffu;
-	sel >>= 3;
-	if (sel < CPU_TSS_SEL_BASE || sel >= CPU_TSS_SEL_BASE + MAXCPU)
-		return (0);
-	return ((int)(sel - CPU_TSS_SEL_BASE));
-}
+/*
+ * S432: cpu_id() used to be a static __inline here that executed `str`
+ * inline.  The instruction now lives in arch/i386/smp.c (see asmble.md:
+ * no assembly outside arch/), so this header only carries the prototype.
+ * The call is one `call`/`ret`; every caller in the tree is on a path that
+ * already touches memory, so the extra indirection does not show up.
+ * S432：cpu_id() 原先是本头文件里的 static __inline，直接内联执行 `str`。
+ * 该指令现已移入 arch/i386/smp.c（asmble.md：arch/ 之外不得有汇编），
+ * 本头文件只保留原型。
+ */
+int	cpu_id(void);
 struct cpu_info {
 	int		ci_id;		/* 0 = BSP */
 	int		ci_active;	/* AP finished basic init */
@@ -121,45 +111,23 @@ void	spin_unlock(struct spinlock *lk);
  *
  * The GCC __sync_* builtins expand to libatomic calls on this -march=i386
  * target ("undefined reference to __sync_fetch_and_add_4"), which the kernel
- * does not link.  These are the same operations spelled out in inline asm:
- * cmpxchg/xadd are 486+ instructions, and this port already relies on 486+
- * features (CR0.WP, invlpg) elsewhere.
+ * does not link, so they are hand-written.  S432 moved those from inline
+ * assembly in this header to arch/i386/atomic.c; the instruction sequences
+ * (lock cmpxchg/xadd, xchg) are 486+ features this port already relies on
+ * elsewhere (CR0.WP, invlpg).
+ * S413：GCC 的 __sync_* 在 -march=i386 下会变成 libatomic 调用（链接时
+ * "undefined reference to __sync_fetch_and_add_4"），因此手写。S432 把原先
+ * 写在本头文件里的内联汇编移到 arch/i386/atomic.c，只留函数声明。
+ *
+ * Every translation unit that needs atomics pulls them in through this
+ * header, so the ARCH gate lives here rather than in each caller.
+ * 所有需要原子的编译单元都通过本头文件获得，因此 ARCH 选择放在这里。
  */
-static __inline int
-atomic_cmpxchg(volatile int *p, int cmp, int set)
-{
-	int prev = cmp;
-
-	__asm __volatile("lock; cmpxchgl %2,%1"
-	    : "+a" (prev), "+m" (*p)
-	    : "r" (set)
-	    : "memory");
-	return (prev);
-}
-
-static __inline int
-atomic_xchg(volatile int *p, int val)
-{
-	int old = val;
-
-	__asm __volatile("xchgl %0,%1"
-	    : "+r" (old), "+m" (*p)
-	    :
-	    : "memory");
-	return (old);
-}
-
-static __inline int
-atomic_add(volatile int *p, int val)
-{
-	int old = val;
-
-	__asm __volatile("lock; xaddl %0,%1"
-	    : "+r" (old), "+m" (*p)
-	    :
-	    : "memory");
-	return (old);			/* the value before the add */
-}
+#if defined(ARCH_i386)
+#include "arch/i386/atomic.h"
+#else
+#error "smp.h: no atomic.h for this ARCH; add one under kernel/arch/<arch>/"
+#endif
 
 /* per-CPU current thread via GS: we store a small header at GS:0 */
 struct kthread *curthread_cpu(void);

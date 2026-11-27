@@ -35,6 +35,7 @@ unsigned hal_user_stack_top(void);
 void	hal_address_space_activate(unsigned pd);
 unsigned hal_address_space_current(void);
 void	hal_cpu_halt(void);
+void	hal_cpu_idle(void);		/* S432: sti+hlt for the idle loop */
 void	hal_syscall_gate_init(void);
 
 /*

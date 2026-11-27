@@ -22,15 +22,16 @@
 
 /*
  * Atomic operations and barriers are architecture-specific and therefore
- * live under kernel/arch/<arch>/ (see asmble.md).  Pull in the declaration
- * for the configured architecture; generic code below only calls the plain
- * C functions declared there.  No inline assembly appears in this header.
+ * live under kernel/arch/<arch>/ (see asmble.md); this header calls the
+ * plain C functions and contains no inline assembly.
+ *
+ * S432: the ARCH gate that used to sit here moved into sys/smp.h, because
+ * kthread.c needs the atomics too and every such file already includes
+ * smp.h.  sys/smp.h pulls in arch/i386/atomic.h for ARCH_i386 and errors
+ * out for any other ARCH, so the include above is enough.
+ * S432：原先这里的 ARCH 选择移到了 sys/smp.h（kthread.c 也要用原子，
+ * 而它已经包含 smp.h），本头文件不再重复选择。
  */
-#if defined(ARCH_i386)
-#include "arch/i386/atomic.h"
-#else
-#error "sync.h: no atomic.h for this ARCH; add one under kernel/arch/<arch>/"
-#endif
 
 /* ------------------------------------------------------------------ */
 /* spinlock - defined in arch/i386/smp.c (struct spinlock in sys/smp.h) */

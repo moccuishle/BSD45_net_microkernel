@@ -10,6 +10,18 @@ ws="$(cd "$(dirname "$0")/.." && pwd)"
 iso="${1:-$ws/out/BSD45-ELF-x86.iso}"
 cd "$ws" || exit 1
 
+# 0) asmble.md pre-flight: no assembly may live outside kernel/arch/.
+#    This is a source-tree rule, not a runtime one, so it fails before any
+#    QEMU is started - a violation would mean the booted kernel is not the
+#    one this tree describes.
+if [ -x tools/check-asm.sh ] || [ -f tools/check-asm.sh ]; then
+	if ! bash tools/check-asm.sh >/tmp/check-asm.out 2>&1; then
+		cat /tmp/check-asm.out
+		echo "all_tests: aborting, asmble.md violation (see above)" >&2
+		exit 1
+	fi
+fi
+
 # 1) stray QEMU (Windows) / qemu (Linux) that may hold the ISO
 if command -v powershell.exe >/dev/null 2>&1; then
 	powershell.exe -NoProfile -Command \

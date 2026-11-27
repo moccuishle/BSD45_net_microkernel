@@ -22,6 +22,7 @@ unsigned	cpu_read_cr3(void);
 void		cpu_halt(void);
 void		cpu_cli(void);
 void		cpu_sti(void);
+void		cpu_idle(void);		/* S432: sti+hlt, one indivisible pair */
 unsigned	cpu_read_esp(void);
 void		cpu_write_esp(unsigned esp);
 unsigned	hal_rdtsc(void);

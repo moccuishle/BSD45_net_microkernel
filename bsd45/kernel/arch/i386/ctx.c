@@ -34,6 +34,7 @@ unsigned hal_user_stack_top(void);
 void	hal_address_space_activate(unsigned pd);
 unsigned hal_address_space_current(void);
 void	hal_cpu_halt(void);
+void	hal_cpu_idle(void);
 void	hal_syscall_gate_init(void);
 
 extern struct user *proc0paddr;
@@ -124,6 +125,25 @@ hal_cpu_halt(void)
 {
 
 	cpu_halt();
+}
+
+/*
+ * EN: Wait for the next interrupt: `sti; hlt` as one indivisible pair.
+ * S432: the idle loop in sys/usermode.c used to inline exactly this, which
+ * asmble.md forbids outside arch/.  Kept separate from hal_cpu_halt()
+ * because that one disables interrupts first and never returns to the loop
+ * (it is the "no runnable process" stop), while this one must be woken by
+ * the next timer tick.
+ * 中文：等下一个中断——`sti; hlt` 必须成对且不可分割。S432 之前这是
+ * sys/usermode.c 空闲循环里的内联汇编。与 hal_cpu_halt() 的区别：后者先
+ * 关中断且不再回到循环（"无进程可运行"的停机），本函数必须被下一次
+ * 时钟唤醒。
+ */
+void
+hal_cpu_idle(void)
+{
+
+	cpu_idle();
 }
 
 /* 中文：在 IDT 中安装 0x80 号系统调用门，指向 syscall_entry 并设为用户态可见的 386 陷阱门 */
