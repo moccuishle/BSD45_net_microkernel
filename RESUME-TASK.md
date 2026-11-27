@@ -945,9 +945,17 @@ address space busy**，`exit 0`。
 > **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache、
 > name cache、fd 表都已加锁；**普通文件 `read(2)` 已摘掉 BKL**（§6.2.9），
 > 其余系统调用仍在 BKL 内。
-> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**：按
-> lseek → fstat → /dev 伪文件 → tmpfs → pipe → console → open/close 的顺序
-> 一条条摘；`smp_user_dispatch` 默认值仍为 0，等 3 小时 soak。
+> **进度（2026-11-28）**：§7.2.1 的 7 条里 **1/2/3/4/5/6 全部落地**
+> （`lseek`+`fstat` §6.2.10、`/dev` 缓冲锁 §6.2.12、tmpfs 节点锁 §6.2.13、
+> pipe §6.2.14、console 读 §6.2.15），第 7 条的 **`close(2)` 已完成**
+> （§6.2.16）。**只剩 `open`/namei 一条**，而它被"没有可睡眠锁"卡住：
+> `vfs_namei()` 的后端 `lookup` 会做阻塞 ATAPI I/O，不能用自旋锁，
+> 只能靠 BKL 保证"查 name cache + 加 vnode 引用"的原子性；要摘必须先有
+> §5 的 turnstile（可睡眠锁），否则会和 `vn_free()` 抢同一个 vnode。
+> 注意：8 核基线里的 `smpuser` 一直把 `smp_user_dispatch` 打开，所以上面
+> 每一步的 8 核验证**都是在 AP 派发用户线程的前提下**跑出来的。
+> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**；`smp_user_dispatch`
+> 默认值仍为 0，等 §7.1 的数小时 soak。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近
