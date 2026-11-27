@@ -2719,6 +2719,32 @@ isofile_exists(const char *path)
 	return (iso_mounted() && iso_lookup(path, &lba, &size) == 0);
 }
 
+/*
+ * P2/§7.2: file descriptor table lock.
+ *
+ * The fd table lives in struct process (uk_fds[NFD]) and is shared by every
+ * thread of that process, so pthreads can open/close/read the same table on
+ * different CPUs once the BKL stops covering the whole syscall.  One global
+ * lock is enough for this port (16 fds per process, NPROC processes).
+ *
+ * Rules:
+ *   - it is a leaf lock: only fd-array scans, validations and offset
+ *     updates happen inside it, never a backend call;
+ *   - taking a vnode reference inside it is allowed and is the documented
+ *     order fd_lock -> vfs_lock; nothing takes fd_lock while holding
+ *     vfs_lock, pipe_lock or the BKL-internal locks;
+ *   - §7.2.1 item 7: *every* slot claim and every reference bump that
+ *     copies one descriptor into another happens under it.  close(2) hands
+ *     its slot back with the BKL dropped (§6.2.16), so the BKL no longer
+ *     serialises the table: a plain scan-then-fill in open()/dup() could
+ *     race with it and end up pinning a vnode that close() had already
+ *     released;
+ *   - the read(2) path below is the first user of it, together with the
+ *     first BKL-dropped syscall path.
+ */
+/* 中文：P2 fd 表锁：fd 表在 struct process 内、由同进程所有线程共享；BKL 一旦不再覆盖整条系统调用，pthread 就会在不同核上并发读写它。本移植用一把全局锁。规则：只做 fd 数组扫描/校验/偏移更新，绝不跨后端调用；锁内可递增 vnode 引用，锁序 fd_lock -> vfs_lock，反向不存在。§7.2.1 第 7 条起，所有槽位认领与"把一个描述符拷成另一个"时的引用递增都必须在本锁内：close(2) 交还槽位时已不持 BKL（§6.2.16），只靠 BKL 不再能串行化这张表。 */
+static struct spinlock fd_lock;
+
 /* 中文：为 ramfs 文件 f 在当前进程分配一个 FD_FILE 描述符并初始化其数据/长度/偏移，返回 fd 号或 -1 */
 /* EN: Allocate an FD_FILE descriptor for ramfs file f in the current process and init its data/len/offset, returning the fd or -1 */
 static int
@@ -2726,6 +2752,16 @@ fd_alloc(struct file *f)
 {
 	int i;
 
+	/*
+	 * §7.2.1 item 7: the slot scan claims are serialised by fd_lock.
+	 * close(2) releases slots with the BKL dropped (§6.2.16), so the BKL
+	 * alone no longer keeps a scanner from taking a slot another thread
+	 * is in the middle of releasing.
+	 * 中文：槽位扫描与认领由 fd_lock 串行化。close(2) 在放掉 BKL 的情况下
+	 * 归还槽位（§6.2.16），只靠 BKL 已不能阻止扫描者拿到另一个线程正在释放
+	 * 的槽。
+	 */
+	spin_lock(&fd_lock);
 	for (i = 3; i < NFD; i++) {
 		if (!cur->uk_fds[i].used) {
 			cur->uk_fds[i].used = 1;
@@ -2739,9 +2775,11 @@ fd_alloc(struct file *f)
 			cur->uk_fds[i].pipeidx = -1;
 			cur->uk_fds[i].rw = 0;
 			cur->uk_fds[i].node = -1;
+			spin_unlock(&fd_lock);
 			return (i);
 		}
 	}
+	spin_unlock(&fd_lock);
 	return (-1);
 }
 
@@ -2752,6 +2790,9 @@ fd_alloc_vnode(struct vnode *vp, int rw, unsigned off)
 {
 	int i;
 
+	/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+	/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+	spin_lock(&fd_lock);
 	for (i = 3; i < NFD; i++) {
 		if (!cur->uk_fds[i].used) {
 			bzero(&cur->uk_fds[i], sizeof(cur->uk_fds[i]));
@@ -2763,6 +2804,7 @@ fd_alloc_vnode(struct vnode *vp, int rw, unsigned off)
 			cur->uk_fds[i].off = off;
 			cur->uk_fds[i].pipeidx = -1;
 			cur->uk_fds[i].node = -1;
+			spin_unlock(&fd_lock);
 			return (i);
 		}
 	}
@@ -2776,6 +2818,9 @@ fd_alloc_dir(unsigned lba, unsigned size)
 {
 	int i;
 
+	/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+	/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+	spin_lock(&fd_lock);
 	for (i = 3; i < NFD; i++) {
 		if (!cur->uk_fds[i].used) {
 			cur->uk_fds[i].used = 1;
@@ -2789,9 +2834,11 @@ fd_alloc_dir(unsigned lba, unsigned size)
 			cur->uk_fds[i].pipeidx = -1;
 			cur->uk_fds[i].rw = 0;
 			cur->uk_fds[i].node = -1;
+			spin_unlock(&fd_lock);
 			return (i);
 		}
 	}
+	spin_unlock(&fd_lock);
 	return (-1);
 }
 
@@ -2925,6 +2972,9 @@ fd_alloc_tmpfile(struct tmpfs_node *n, int rw, unsigned off)
 {
 	int i;
 
+	/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+	/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+	spin_lock(&fd_lock);
 	for (i = 3; i < NFD; i++) {
 		if (!cur->uk_fds[i].used) {
 			bzero(&cur->uk_fds[i], sizeof(cur->uk_fds[i]));
@@ -2935,9 +2985,11 @@ fd_alloc_tmpfile(struct tmpfs_node *n, int rw, unsigned off)
 			cur->uk_fds[i].off = off;
 			cur->uk_fds[i].len = n->size;
 			cur->uk_fds[i].pipeidx = -1;
+			spin_unlock(&fd_lock);
 			return (i);
 		}
 	}
+	spin_unlock(&fd_lock);
 	return (-1);
 }
 
@@ -2948,6 +3000,9 @@ fd_alloc_tmpdir(void)
 {
 	int i;
 
+	/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+	/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+	spin_lock(&fd_lock);
 	for (i = 3; i < NFD; i++) {
 		if (!cur->uk_fds[i].used) {
 			bzero(&cur->uk_fds[i], sizeof(cur->uk_fds[i]));
@@ -2956,9 +3011,11 @@ fd_alloc_tmpdir(void)
 			cur->uk_fds[i].dpos = 0;
 			cur->uk_fds[i].node = -1;
 			cur->uk_fds[i].pipeidx = -1;
+			spin_unlock(&fd_lock);
 			return (i);
 		}
 	}
+	spin_unlock(&fd_lock);
 	return (-1);
 }
 
@@ -2990,26 +3047,6 @@ static struct pipe pipes[NPIPE];
  * proc_wake/sched_runnable).  No path takes sc_rqlock and then pipe_lock.
  */
 static struct spinlock pipe_lock;
-
-/*
- * P2/§7.2: file descriptor table lock.
- *
- * The fd table lives in struct process (uk_fds[NFD]) and is shared by every
- * thread of that process, so pthreads can open/close/read the same table on
- * different CPUs once the BKL stops covering the whole syscall.  One global
- * lock is enough for this port (16 fds per process, NPROC processes).
- *
- * Rules:
- *   - it is a leaf lock: only fd-array scans, validations and offset
- *     updates happen inside it, never a backend call;
- *   - taking a vnode reference inside it is allowed and is the documented
- *     order fd_lock -> vfs_lock; nothing takes fd_lock while holding
- *     vfs_lock, pipe_lock or the BKL-internal locks;
- *   - the read(2) path below is the first user of it, together with the
- *     first BKL-dropped syscall path.
- */
-/* 中文：P2 fd 表锁：fd 表在 struct process 内、由同进程所有线程共享；BKL 一旦不再覆盖整条系统调用，pthread 就会在不同核上并发读写它。本移植用一把全局锁。规则：只做 fd 数组扫描/校验/偏移更新，绝不跨后端调用；锁内可递增 vnode 引用，锁序 fd_lock -> vfs_lock，反向不存在。 */
-static struct spinlock fd_lock;
 
 /* 中文：分配一个空闲管道槽位并清零，返回管道指针，无空闲则返回 0 */
 /* EN: Allocate and clear a free pipe slot, returning its pointer or 0 if none */
@@ -4763,10 +4800,21 @@ do_fork(struct sysregs *r)
 	p->uk_brk_mapped = cur->uk_brk_mapped;
 	bcopy(cur->uk_p_cwd, p->uk_p_cwd, sizeof(p->uk_p_cwd));
 	bcopy(cur->uk_p_comm, p->uk_p_comm, sizeof(p->uk_p_comm));
-	bcopy(cur->uk_fds, p->uk_fds, sizeof(p->uk_fds));
 	{
 		int i;
 
+		/*
+		 * §7.2.1 item 7: copy the table and take the references in one
+		 * fd_lock section.  A sibling thread of the parent may be in
+		 * close(2) right now (it drops the BKL), and the vnode whose
+		 * descriptor we just copied could reach ref 0 before our
+		 * vn_ref() -- which would resurrect a freed vnode.
+		 * 中文：拷贝 fd 表与取引用在同一段 fd_lock 内完成。父进程的兄弟
+		 * 线程此刻可能正在 close(2)（它会放掉 BKL），我们刚拷过来的那个
+		 * 描述符的 vnode 可能在 vn_ref() 之前就降到 ref 0，从而被复活。
+		 */
+		spin_lock(&fd_lock);
+		bcopy(cur->uk_fds, p->uk_fds, sizeof(p->uk_fds));
 		for (i = 0; i < NFD; i++)
 			if (p->uk_fds[i].used && p->uk_fds[i].vp != 0)
 				vn_ref(p->uk_fds[i].vp);
@@ -4775,6 +4823,7 @@ do_fork(struct sysregs *r)
 			    p->uk_fds[i].pipeidx >= 0)
 				pipe_addref(&pipes[p->uk_fds[i].pipeidx],
 				    p->uk_fds[i].rw);
+		spin_unlock(&fd_lock);
 	}
 	p->uk_regs = *r;
 	p->uk_regs.eax = 0;		/* the child returns 0 from fork() */
@@ -6139,6 +6188,45 @@ thread_yield(struct sysregs *r)
 	proc_sched();
 }
 
+/*
+ * §7.2.1 item 7: resolve the path for open(2), with the BKL released when the
+ * root backend can be walked concurrently (vfs_namei_bklfree()).
+ *
+ * This is the last blocking hole in the syscall: a cold path walk reads
+ * directory sectors from the ATAPI CD, which takes milliseconds, and it used
+ * to hold the BKL for all of them.  Everything the walk touches is locked on
+ * its own now -- vnode pool (vfs_lock), name cache (vfs_lock -> nc_lock),
+ * buffer cache (bio_lock), tmpfs nodes (tmpfs_lock) -- and vfs_namei() holds
+ * a reference on every directory it descends into, so no vnode can be freed
+ * under it.  Nothing here needs the process descriptor table, so the BKL is
+ * reacquired before returning: the fd slot claim below still runs inside it.
+ */
+/* 中文：§7.2.1 第 7 条：open(2) 的路径解析，根后端能并发遍历时（vfs_namei_bklfree()）
+ * 不持 BKL。这是系统调用里最后一个会长时间阻塞的地方：冷路径要在 ATAPI 光盘上读目录
+ * 扇区，耗时毫秒级，过去整段时间都占着 BKL。现在它触及的结构各自有锁——vnode 池
+ * vfs_lock、名字缓存 vfs_lock -> nc_lock、缓冲缓存 bio_lock、tmpfs 节点 tmpfs_lock——
+ * 且 vfs_namei() 对每一级目录都持有引用，没有 vnode 会在它下面被释放。这里不需要进程
+ * 描述符表，所以返回前重新取回 BKL：下面的 fd 槽认领仍在 BKL 内。
+ */
+static int
+open_resolve(const char *path, int flags, struct vnode **vpp)
+{
+	struct vnode *vp = 0;
+	int rv, nobkl = vfs_namei_bklfree();
+
+	if (nobkl)
+		smp_bkl_drop();
+	rv = vfs_namei(path, &vp);
+	if (rv < 0 && (flags & O_CREAT))
+		rv = vfs_create(path, 0, &vp);
+	if (nobkl)
+		smp_bkl_enter();
+	if (rv < 0)
+		return (rv);
+	*vpp = vp;
+	return (0);
+}
+
 /* 中文：原生 4.5BSD 系统调用分发器：按 eax 调用号分派到各系统调用实现，结果写回 r->eax */
 /* EN: Native 4.5BSD system-call dispatcher: dispatch on the eax call number to the various syscall implementations, writing the result back to r->eax */
 int
@@ -6699,10 +6787,14 @@ bsd45_syscall(struct sysregs *r)
 			    (strcmp(path, "/dev/ps") == 0) ? FD_PS :
 			    (strcmp(path, "/dev/vmstat") == 0) ? FD_VMSTAT :
 			    FD_CONSOLE;
+			/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+			/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+			spin_lock(&fd_lock);
 			for (fd = 0; fd < NFD; fd++)
 				if (!cur->uk_fds[fd].used)
 					break;
 			if (fd >= NFD) {
+				spin_unlock(&fd_lock);
 				r->eax = (unsigned)-EMFILE;
 				break;
 			}
@@ -6713,20 +6805,22 @@ bsd45_syscall(struct sysregs *r)
 			cur->uk_fds[fd].pipeidx = -1;
 			cur->uk_fds[fd].node = -1;
 			cur->uk_fds[fd].vp = 0;
+			spin_unlock(&fd_lock);
 			r->eax = (unsigned)fd;
 			break;
 		}
-		rv = vfs_namei(path, &vp);
+		/*
+		 * §7.2.1 item 7: the walk itself runs without the BKL (see
+		 * open_resolve()).  A failed lookup without O_CREAT still
+		 * reports ENOENT, exactly as before -- the backend's -EIO or
+		 * -ENOMEM was never visible to open(2) here.
+		 */
+		/* 中文：§7.2.1 第 7 条：遍历本身不持 BKL（见 open_resolve()）。未带 O_CREAT 的查找失败仍报 ENOENT，与旧行为一致——后端的 -EIO/-ENOMEM 从来不会从这里漏给 open(2)。 */
+		rv = open_resolve(path, flags, &vp);
 		if (rv < 0) {
-			if (!(flags & O_CREAT)) {
-				r->eax = (unsigned)-ENOENT;
-				break;
-			}
-			rv = vfs_create(path, 0, &vp);
-			if (rv < 0) {
-				r->eax = (unsigned)rv;
-				break;
-			}
+			r->eax = (flags & O_CREAT) ? (unsigned)rv :
+			    (unsigned)-ENOENT;
+			break;
 		}
 		rw = ((flags & O_ACCMODE) == O_RDONLY) ? 1 : 2;
 		if (flags & O_TRUNC) {
@@ -7355,10 +7449,27 @@ bsd45_syscall(struct sysregs *r)
 		if (cmd == 0) {		/* F_DUPFD: lowest free fd >= arg */
 			int newfd;
 
+			/*
+			 * §7.2.1 item 7: scan, copy and reference bump in one
+			 * fd_lock section.  If the source descriptor is
+			 * closed on another CPU (close(2) drops the BKL) in
+			 * between, its vnode reference could reach zero and
+			 * fd_ref() would resurrect a freed vnode.
+			 * 中文：扫描、拷贝与引用递增在同一段 fd_lock 内。若源描述符
+			 * 被另一个核关掉（close(2) 会放掉 BKL）而夹在中间，它的
+			 * vnode 引用会降到 0，fd_ref() 就会复活已释放的 vnode。
+			 */
+			spin_lock(&fd_lock);
+			if (!cur->uk_fds[fd].used) {
+				spin_unlock(&fd_lock);
+				r->eax = (unsigned)-EBADF;
+				break;
+			}
 			for (newfd = arg; newfd < NFD; newfd++)
 				if (!cur->uk_fds[newfd].used)
 					break;
 			if (newfd >= NFD) {
+				spin_unlock(&fd_lock);
 				r->eax = (unsigned)-EMFILE;
 				break;
 			}
@@ -7368,6 +7479,7 @@ bsd45_syscall(struct sysregs *r)
 			    cur->uk_fds[newfd].pipeidx >= 0)
 				pipe_addref(&pipes[cur->uk_fds[newfd].pipeidx],
 				    cur->uk_fds[newfd].rw);
+			spin_unlock(&fd_lock);
 			r->eax = newfd;
 			break;
 		}
@@ -7385,10 +7497,19 @@ bsd45_syscall(struct sysregs *r)
 			r->eax = (unsigned)-EBADF;
 			break;
 		}
+		/* §7.2.1 item 7: scan, copy and reference bump under fd_lock. */
+		/* 中文：§7.2.1 第 7 条：扫描、拷贝与引用递增都在 fd_lock 内。 */
+		spin_lock(&fd_lock);
+		if (!cur->uk_fds[from].used) {
+			spin_unlock(&fd_lock);
+			r->eax = (unsigned)-EBADF;
+			break;
+		}
 		for (to = 3; to < NFD; to++)
 			if (!cur->uk_fds[to].used)
 				break;
 		if (to >= NFD) {
+			spin_unlock(&fd_lock);
 			r->eax = (unsigned)-EMFILE;
 			break;
 		}
@@ -7397,6 +7518,7 @@ bsd45_syscall(struct sysregs *r)
 		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0)
 			pipe_addref(&pipes[cur->uk_fds[to].pipeidx],
 			    cur->uk_fds[to].rw);
+		spin_unlock(&fd_lock);
 		r->eax = to;
 		break;
 	}
@@ -7418,6 +7540,9 @@ bsd45_syscall(struct sysregs *r)
 		pp->readers = 1;
 		pp->writers = 1;
 		spin_unlock(&pipe_lock);
+		/* §7.2.1 item 7: claim under fd_lock (see fd_alloc()). */
+		/* 中文：§7.2.1 第 7 条：在 fd_lock 内认领（见 fd_alloc()）。 */
+		spin_lock(&fd_lock);
 		for (i = 3; i < NFD && nfd < 2; i++) {
 			if (!cur->uk_fds[i].used) {
 				fds[nfd++] = i;
@@ -7434,6 +7559,7 @@ bsd45_syscall(struct sysregs *r)
 				cur->uk_fds[i].rw = (nfd == 1) ? 1 : 2;
 			}
 		}
+		spin_unlock(&fd_lock);
 		if (nfd < 2) {
 			spin_lock(&pipe_lock);
 			pp->used = 0;
@@ -7459,11 +7585,30 @@ bsd45_syscall(struct sysregs *r)
 			break;
 		}
 		fd_close(to);
+		/*
+		 * §7.2.1 item 7: the descriptor copy and its reference bump are
+		 * one fd_lock section, and `from` is revalidated inside it --
+		 * another thread of this process may have closed it (close(2)
+		 * runs with the BKL dropped) between the check above and here.
+		 * Holding the BKL around this pair is not enough any more:
+		 * fd_close_common() releases a slot without it.
+		 * 中文：描述符拷贝与引用递增在同一段 fd_lock 内，并在锁内重新校验
+		 * from——本进程的另一个线程可能在上面那次检查之后把它关掉
+		 * （close(2) 在 BKL 外运行）。只在这对操作外面拿 BKL 已经不够：
+		 * fd_close_common() 归还槽位时并不持 BKL。
+		 */
+		spin_lock(&fd_lock);
+		if (!cur->uk_fds[from].used) {
+			spin_unlock(&fd_lock);
+			r->eax = (unsigned)-EBADF;
+			break;
+		}
 		cur->uk_fds[to] = cur->uk_fds[from];
 		fd_ref(&cur->uk_fds[to]);
 		if (cur->uk_fds[to].type == FD_PIPE && cur->uk_fds[to].pipeidx >= 0)
 			pipe_addref(&pipes[cur->uk_fds[to].pipeidx],
 			    cur->uk_fds[to].rw);
+		spin_unlock(&fd_lock);
 		r->eax = to;
 		break;
 	}

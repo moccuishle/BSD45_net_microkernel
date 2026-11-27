@@ -62,6 +62,33 @@ vfs_root_source(void)
 	return (vfs_root_src);
 }
 
+/*
+ * §7.2.1 item 7: can a path walk run with the BKL released?
+ *
+ * Only the backends with their own concurrency story qualify: ISO9660 is
+ * immutable and reads through the buffer cache, tmpfs guards every node
+ * field with tmpfs_lock.  JLFS (installed root) and FFS have no node lock
+ * at all, so namei() stays inside the BKL there -- the same gate write(2)
+ * uses for its backend.
+ *
+ * The flag is computed once in vfs_init() and only read afterwards, so it
+ * needs no lock.
+ */
+/* 中文：§7.2.1 第 7 条：这条路能不能在 BKL 外解析。只有自带并发保证的后端够格：
+ * ISO9660 只读且读走缓冲缓存，tmpfs 用 tmpfs_lock 覆盖全部节点字段。JLFS（安装到
+ * 硬盘时的根）与 FFS 根本没有节点锁，那里 namei 仍留在 BKL 内——与 write(2) 对
+ * 后端设的门槛一致。标志在 vfs_init() 一次算定，之后只读，无需加锁。 */
+static int vfs_namei_nobkl;
+
+/* EN: Reports whether path resolution may run without the BKL on this boot's root filesystem. */
+/* 中文：报告本次启动的根文件系统上路径解析能否不持 BKL。 */
+int
+vfs_namei_bklfree(void)
+{
+
+	return (vfs_namei_nobkl);
+}
+
 /* ---------------------------------------------------------------- helpers */
 
 #define	VNODES		96
@@ -528,6 +555,16 @@ vfs_init(void)
 	spin_init(&vfs_lock);
 	vn_init();
 	/*
+	 * §7.2.1 item 7: only ISO9660 and tmpfs can be walked concurrently
+	 * (see vfs_namei_bklfree()).  A JLFS or FFS root keeps namei() inside
+	 * the BKL, so open(2) does not drop it on an installed system yet.
+	 * 中文：只有 ISO9660 与 tmpfs 能并发遍历（见 vfs_namei_bklfree()）。
+	 * JLFS/FFS 作根时 namei 仍留在 BKL 内，因此安装到硬盘的系统上 open(2)
+	 * 暂不放掉 BKL。
+	 */
+	vfs_namei_nobkl = (vfs_root_src == VFS_ROOT_ISO ||
+	    vfs_root_src == VFS_ROOT_TMPFS);
+	/*
 	 * S17: bring up the three caches before the first namei().  The pages
 	 * for the buffer cache and the page cache are allocated once, now, so
 	 * they show up in the page accounting as a fixed baseline instead of
@@ -579,11 +616,50 @@ vfs_init(void)
 }
 
 /*
+ * Drop the reference a walk holds on the directory it just left.  The four
+ * mount roots are static and keep their single reference forever (vn_put()
+ * ignores them as well); this guard just keeps that obvious at the call
+ * sites.
+ */
+/* 中文：放掉遍历刚离开的那个目录的引用。四个挂载根是静态的、永远保留那一个引用
+ * （vn_put() 本身也会忽略它们）；这个判断只是让调用点一眼看清。 */
+static void
+namei_put(struct vnode *vp)
+{
+
+	if (vp != rootvnode && !tmpfs_is_root(vp))
+		vn_put(vp);
+}
+
+/*
  * Resolve an absolute path.  "/tmp" (and anything under it) is a mount of
  * the tmpfs root; everything else lives on the ISO9660 image.
+ *
+ * §7.2.1 item 7: this runs with the BKL released for the backends listed by
+ * vfs_namei_bklfree(), so the whole walk has to be self-locking.  Three
+ * rules make that true, and they are the reason no path lock is needed:
+ *
+ *  1. Every step holds a reference on the directory it is searching.  A
+ *     reference is taken by vn_alloc() (fresh lookups), by
+ *     namecache_lookup()/namecache_enter_unique() (cache hits), and the
+ *     root is static, so vn_free() can never recycle the vnode under us.
+ *     The previous directory's reference is dropped only *after* the next
+ *     component has been resolved.
+ *  2. Publishing a lookup result and taking its reference is one atomic
+ *     operation (namecache_enter_unique(), pool lock -> name-cache lock),
+ *     so two CPUs that miss the same name cannot end up with two vnodes
+ *     for one file.
+ *  3. The backend lookup itself holds no core lock: ISO9660 is immutable
+ *     and reads through the buffer cache (bio_lock inside bread/brelse),
+ *     tmpfs scans its node table under tmpfs_lock.  JLFS/FFS have no node
+ *     lock yet, which is exactly why they keep the BKL (see vfs_init()).
+ *
+ * Errors put back the directory reference: an unlinked path used to leak
+ * one, which the pool (VNODES slots) cannot afford now that several CPUs
+ * can be walking at once.
  */
-/* EN: Walks an absolute path from rootvnode, mapping /tmp to the tmpfs root and asking the name cache before ops->lookup; returns a referenced vnode in vpp, or a negative errno. */
-/* 中文：从 rootvnode 逐段解析绝对路径，/tmp 直接映射到 tmpfs 根，其余先查名字缓存再调 ops->lookup；成功在 vpp 返回带引用的 vnode，失败返回负 errno。 */
+/* EN: Walks an absolute path from rootvnode, mapping /tmp to the tmpfs root and asking the name cache before ops->lookup; returns a referenced vnode in vpp, or a negative errno. Runs without the BKL for ISO9660/tmpfs (see vfs_namei_bklfree); every step holds a reference on the directory being searched. */
+/* 中文：从 rootvnode 逐段解析绝对路径，/tmp 直接映射到 tmpfs 根，其余先查名字缓存再调 ops->lookup；成功在 vpp 返回带引用的 vnode，失败返回负 errno。对 ISO9660/tmpfs 不持 BKL 运行，每一步都持有正在搜索的目录的引用。 */
 int
 vfs_namei(const char *path, struct vnode **vpp)
 {
@@ -601,13 +677,15 @@ vfs_namei(const char *path, struct vnode **vpp)
 		char name[48];
 		const char *slash = p;
 		int n;
-		struct vnode *next;
+		struct vnode *next, *canon;
 
 		while (*slash && *slash != '/')
 			slash++;
 		n = slash - p;
-		if (n == 0 || n >= (int)sizeof(name))
+		if (n == 0 || n >= (int)sizeof(name)) {
+			namei_put(vp);
 			return (-ENOENT);
+		}
 		bcopy(p, name, n);
 		name[n] = 0;
 
@@ -618,17 +696,27 @@ vfs_namei(const char *path, struct vnode **vpp)
 			 * S17: ask the name cache first; on a miss do the
 			 * backend lookup and remember it.  A cache hit comes
 			 * back already referenced, exactly like a lookup.
+			 * The enter is the find-or-insert form: if another
+			 * CPU published the name while we were in the
+			 * backend, we adopt its vnode and drop the extra one
+			 * we just allocated.
 			 */
+			/* 中文：先查名字缓存，未命中才调后端并记住结果。命中时已带回引用，与 lookup 相同。回填用"查到就复用"的形式：若在我们进后端期间别的核已经发布了这个名字，就沿用它的 vnode 并丢弃自己多分配的那个。 */
 			next = namecache_lookup(vp, name);
 			if (next == 0) {
 				rv = vp->ops->lookup(vp, name, &next);
-				if (rv < 0)
+				if (rv < 0) {
+					namei_put(vp);
 					return (rv);
-				namecache_enter(vp, name, next);
+				}
+				canon = namecache_enter_unique(vp, name, next);
+				if (canon != next) {
+					vn_put(next);
+					next = canon;
+				}
 			}
 		}
-		if (vp != rootvnode && !tmpfs_is_root(vp))
-			vn_put(vp);
+		namei_put(vp);
 		vp = next;
 		if (*slash == 0) {
 			*vpp = vp;
@@ -743,8 +831,24 @@ vfs_create(const char *path, int isdir, struct vnode **vpp)
 		rv = dv->ops->create ? dv->ops->create(dv, name, vpp) :
 		    -EROFS;
 	}
-	if (rv == 0)
+	if (rv == 0) {
+		struct vnode *canon;
+
+		/*
+		 * §7.2.1 item 7: purge first (a negative entry may be cached
+		 * for this name, and the path must become visible), then
+		 * publish through the find-or-insert form.  Two CPUs creating
+		 * or looking up the same new name concurrently therefore end
+		 * up sharing one vnode instead of each holding its own.
+		 */
+		/* 中文：先 purge（这个名字可能存着负缓存项，且创建后必须立即可见），再用"查到就复用"的形式发布。于是两个核并发创建/查找同一个新名字时共用一个 vnode，而不是各持一个。 */
 		namecache_purge(dv, name);
+		canon = namecache_enter_unique(dv, name, *vpp);
+		if (canon != *vpp) {
+			vn_put(*vpp);
+			*vpp = canon;
+		}
+	}
 	vn_put(dv);
 	return (rv);
 }

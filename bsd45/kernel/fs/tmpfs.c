@@ -198,8 +198,8 @@ tmpfs_create_node_locked(const char *name, int isdir)
 
 /* ---------------------------------------------------------------- vnodeops */
 
-/* EN: Only the tmpfs root is searchable (else -ENOENT); a hit gets a vn_alloc()ed vnode typed VDIR/VREG from n->isdir, with tmpfs_vnodeops and the node index; -ENOMEM if alloc fails. */
-/* 中文：只允许查 tmpfs 根目录（否则 -ENOENT）；命中后用 vn_alloc() 分配 vnode，按 n->isdir 置 VDIR/VREG、ops 与节点下标并返回 0，分配失败返回 -ENOMEM。 */
+/* EN: Only the tmpfs root is searchable (else -ENOENT); a hit gets a vn_alloc()ed vnode typed VDIR/VREG from n->isdir, with tmpfs_vnodeops and the node index; -ENOMEM if alloc fails. The node is revalidated after the (lock-free) allocation, so a lookup that raced with remove/rmdir cannot hand out a vnode for a slot that has since been reused. */
+/* 中文：只允许查 tmpfs 根目录（否则 -ENOENT）；命中后用 vn_alloc() 分配 vnode，按 n->isdir 置 VDIR/VREG、ops 与节点下标并返回 0，分配失败返回 -ENOMEM。分配在锁外进行，之后要重新校验该节点，避免与 remove/rmdir 竞争的 lookup 把已被复用的槽交出去。 */
 static int
 tmpfs_lookup_op(struct vnode *dv, const char *name, struct vnode **vpp)
 {
@@ -227,6 +227,23 @@ tmpfs_lookup_op(struct vnode *dv, const char *name, struct vnode **vpp)
 	vp = vn_alloc();
 	if (vp == 0)
 		return (-ENOMEM);
+	/*
+	 * §7.2.1 item 7: namei() runs without the BKL now, so a remove(2) or
+	 * rmdir(2) can delete this node (and another create reuse the slot)
+	 * between the scan above and this point.  Re-find the name and
+	 * require the same slot; otherwise the vnode would describe a file
+	 * the caller never asked for.
+	 * 中文：namei 现在不持 BKL，上面的扫描与这里之间可能被 remove/rmdir 删掉该节点、
+	 * 再被 create 复用同一个槽。重新按名字查找并要求落在同一个槽，否则这个 vnode
+	 * 描述的就是调用者没要的文件。
+	 */
+	spin_lock(&tmpfs_lock);
+	if (tmpfs_find_locked(name) != &tmpfs_nodes[idx]) {
+		spin_unlock(&tmpfs_lock);
+		vn_put(vp);
+		return (-ENOENT);
+	}
+	spin_unlock(&tmpfs_lock);
 	vp->type = isdir ? VDIR : VREG;
 	vp->ops = &tmpfs_vnodeops;
 	vp->node = idx;

@@ -156,6 +156,13 @@ int	vfs_root_source(void);
 void	vfs_init(void);
 int	vfs_namei(const char *path, struct vnode **vpp);
 /*
+ * §7.2.1 item 7: non-zero when this boot's root backend can be walked with
+ * the BKL released (ISO9660, tmpfs).  open(2) uses it as the gate; JLFS/FFS
+ * have no node lock yet and stay inside the BKL.
+ */
+/* 中文：§7.2.1 第 7 条：本次启动的根后端能否在不持 BKL 的情况下遍历（ISO9660、tmpfs）。open(2) 用它作门控；JLFS/FFS 还没有节点锁，仍留在 BKL 内。 */
+int	vfs_namei_bklfree(void);
+/*
  * S29: kstr path entry points.  The A callers above stay for the historical
  * syscall ABI; the W syscall path and future file-system code use these so
  * path traversal is expressed in the kernel's native string type.
@@ -201,7 +208,14 @@ void	bio_stats(unsigned *total, unsigned *used, unsigned *hits,
 /* Name cache (vfs_cache.c). */
 void	namecache_init(void);
 struct vnode *namecache_lookup(struct vnode *dv, const char *name);
-void	namecache_enter(struct vnode *dv, const char *name,
+/*
+ * Find-or-insert in one critical section, so only one vnode can own a
+ * (directory, name) pair.  Returns a referenced vnode; when that is not vp
+ * the caller must vn_put(vp).  This is what lets namei() run without the
+ * BKL: publishing the lookup result and taking the reference are one step.
+ */
+/* 中文：同一临界区内"查到就复用、查不到就插入"，使一个 (目录, 名字) 只可能对应一个 vnode。返回已加引用的 vnode；不等于 vp 时调用者须 vn_put(vp)。namei 能摘掉 BKL 靠的就是"发布结果 + 取引用"是同一个动作。 */
+struct vnode *namecache_enter_unique(struct vnode *dv, const char *name,
 	    struct vnode *vp);
 void	namecache_purge(struct vnode *dv, const char *name);
 void	namecache_purge_vp(struct vnode *vp);

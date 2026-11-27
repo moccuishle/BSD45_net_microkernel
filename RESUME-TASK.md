@@ -850,6 +850,88 @@ busy**，`exit 0`。
 8 核 3 GB 基线全过，**0 TRAP / triple fault / STACK OVERFLOW /
 address space busy**，`exit 0`。
 
+### 6.2.17 P2 第十二步：open(2)/namei 摘 BKL（§7.2.1 第 7 条收口）（2026-11-28）
+
+**§7.2.1 的 7 条到此全部完成。** 这一步没有引入任何新锁类型，也没有上
+turnstile——不是偷懒，而是重新算了一遍发现**不需要**。
+
+- **为什么不需要路径级锁**：§6.2.16 里的顾虑是"查 name cache + 给 vnode
+  加引用只能靠 BKL 原子"。其实 §6.2.8 之后命中侧已经是原子动作
+  （`namecache_lookup()` 在 `vfs_lock -> nc_lock` 里校验 `v_id` 后
+  `vn_ref_locked()`）。真正缺的是**回填**那一半：老的 `namecache_enter()`
+  是无条件覆盖，两个核同时 miss 同一个名字时各自拿到一个 vnode，于是同一个
+  文件有两个句柄、两套页缓存键。把"查到就复用、查不到就插入"合成一个临界区
+  （`namecache_enter_unique()`）之后，命中与回填两侧对称，路径级锁就多余了。
+  §5.2 的四条前提（可睡眠锁 + 锁嵌套 + 多 donor + 实时性）也都不成立。
+- **改动清单**：
+  1. `namecache_enter()` → `namecache_enter_unique()`（`vfs_cache.c` /
+     `vfs.h`）：在池锁 + 名字缓存锁内先校验既有表项，有效就
+     `vn_ref_locked()` 并返回它、调用者 `vn_put()` 自己刚分配的那个；否则
+     插入并返回传入的 vnode。返回值恒为"已加引用"，不等于 `vp` 时调用者
+     负责释放——**发布结果与取引用是同一个原子动作**。
+  2. `vfs_namei()`（`vfs.c`）：改用上面的形式；**修掉错误路径的引用泄漏**
+     （新的 `namei_put()`，以前 lookup 失败时父目录的引用会漏掉一个，
+     `VNODES` 只有 96 个槽，多核并发遍历下立刻就会耗尽）；把三条不变式写进
+     注释：每步持有正在搜索目录的引用 / 发布与取引用原子 / 后端 lookup
+     不持核心锁。
+  3. `vfs_create()`：purge 之后也用 `namecache_enter_unique()` 发布，
+     两个核并发创建（或创建与查找）同一个新名字时共用一个 vnode。
+  4. **ISO9660（`isofs.c`）删掉文件级 `secbuf`**：`find_in_dir()` /
+     `iso_readdir()` / `iso_mount()` 改成就地在 `bread()` 的块里解析、扫完
+     `brelse()`。这是摘 BKL 的硬前提——原来两个并发 lookup 会互相覆盖扇区
+     缓冲，可能返回**错 extent 的 vnode**（比死锁更难查）。
+  5. **tmpfs（`tmpfs.c`）**：`tmpfs_lookup_op()` 在锁外 `vn_alloc()` 之后
+     **重新校验**这个名字仍落在同一个槽；否则 remove/rmdir + create 复用槽
+     的窗口里，会交出一个描述"别的文件"的 vnode。
+  6. **`open(2)`**（`usermode.c`）：路径解析抽成 `open_resolve()`，
+     `vfs_namei_bklfree()` 为真时 `smp_bkl_drop()/enter()`；`/dev/*` 与
+     `/srv/` 分支不动；`O_TRUNC`/`O_APPEND`/`fd_alloc_vnode` 仍留在 BKL
+     内（都是内存操作，快）。失败映射保持原样：不带 `O_CREAT` 一律 `ENOENT`。
+  7. **fd 表加固（顺带修 §6.2.16 留下的窗口）**：close(2) 在 BKL 外交还
+     槽位之后，"扫描槽位 + 填字段"与"把一个描述符拷成另一个再加引用"都必须
+     持 `fd_lock`：5 个 `fd_alloc*`、open 的 `/dev` 分支、`dup`、`dup2`、
+     `fcntl(F_DUPFD)`、`fork` 的 fd 拷贝。否则 `vn_ref()` 会**复活**一个
+     已经被 close 释放的 vnode（`dup2` 的"先查 from 再 fd_ref"序列最典型）。
+     为此把 `fd_lock` 的声明从 pipe 段前移到 fd 段之前。
+- **门控**：`vfs_namei_bklfree()` 只在根后端是 ISO9660 / tmpfs 时为真。
+  JLFS / FFS 没有节点锁，安装到硬盘的系统上 `open(2)` 仍在 BKL 内——与
+  `write(2)` 对后端设的门槛完全一致。`vfs_namei()` 本身对两种用法都正确，
+  门控只决定"要不要放 BKL"。
+- **已知限制（记录在案，不在这一步修）**：
+  - `unlink` 一个仍被打开的文件后复用其 tmpfs 槽，既有 fd 会指向新文件
+    （缺节点引用计数，摘 BKL 之前就存在）。`tmpfs_lookup_op()` 的重新校验
+    只覆盖"lookup 与 remove 竞争"这一个窗口。
+  - `read(2)` 的伪设备分支只看 `uk_fds[fd]` 的几个标量、不持 `fd_lock`，
+    与 BKL 外的 close(2) 并发时最坏是重渲染一份快照，无内存安全问题。
+- **并发证据**：`libexec/rdstress.c` 扩了一段"共享一个 tmpfs 名字做
+  open(O_CREAT|O_TRUNC)/write/close/unlink"的循环，与原有的
+  "4 子进程 × 32 次 open/read/close" 并行跑——前者正对着"一个名字两个
+  vnode""lookup 撞 remove"两个新窗口。
+
+**验证（2026-11-28）**：全套 26 套 **24 PASS + 2 已知失效**（`test_subsys`/
+`test_ipl`，与基线逐套一致，无回归）；8 核 3 GB（`--smp 8`，含 `smpon` +
+`smpuser`）`rdstress` / `pthread` / `pthmain` / `pthpre` / `aiotest` 全 PASS，
+**0 TRAP / triple fault / STACK OVERFLOW / address space busy**，`exit 0`。
+注：`tools/qdrive.py` 偶发打印 `boot timeout (no monitor prompt)`——QEMU 的
+`-serial ... wait=off` 不等客户端连接，客人先跑起来时提示符已经滚过去了；
+它只影响日志开头是否完整，命令仍会照发，判据看日志里的 PASS 行。
+注：QEMU 不在 `PATH` 里时 `qdrive.py` 会直接
+`FileNotFoundError`（它按名字起进程），本机路径是
+`C:\msys64\ucrt64\bin\qemu-system-i386.exe`，跑之前先
+`export PATH="/c/msys64/ucrt64/bin:$PATH"`。另外 `--log` 是**追加**写的，
+重跑前记得先删旧日志，否则会把上一次的输出混进来。
+
+**一次未复现的挂起（记录在案）**：`reg8d` 那次 8 核基线停在
+`execve /bin/aiotest: entry ...` 之后，五秒内 QEMU 的 CPU 时间几乎不涨
+（354.83 → 354.86），`qdrive` 超时退出。当时机器上**同时跑着第二个
+qemu + qdrive**（端口/CPU 争抢，两份日志都是空的），随后单独连跑 6 次
+`/bin/aiotest` 全部 PASS（`token=3..12`），再跑一次完整 8 核基线
+（`reg8e`，独占机器）也 PASS（`token=1/2`，`[user exit 0]`）。
+倾向判断是并发跑测导致的调度饥饿，而不是 `open(2)` 改动引入的死锁——
+`aiotest` 走的是 `aio_wait_sys()` 阻塞 + `softirq` 唤醒，与 namei 无关；
+但**没有定位到根因**，后续开 `smp_user_dispatch` 默认值前应补一次
+长时间 soak 观察（见 §7.1）。
+
 ### 6.3 调度 / 作业控制功能缺口
 
 - **真 `fg`/`bg`**：sh 监视模式（`set -m`）+ `tcsetpgrp` + 后台读终端
@@ -945,17 +1027,16 @@ address space busy**，`exit 0`。
 > **进度（2026-11-26）**：VFS vnode 池、pipe 表、page cache、buffer cache、
 > name cache、fd 表都已加锁；**普通文件 `read(2)` 已摘掉 BKL**（§6.2.9），
 > 其余系统调用仍在 BKL 内。
-> **进度（2026-11-28）**：§7.2.1 的 7 条里 **1/2/3/4/5/6 全部落地**
+> **进度（2026-11-28）**：§7.2.1 的 7 条**全部落地**
 > （`lseek`+`fstat` §6.2.10、`/dev` 缓冲锁 §6.2.12、tmpfs 节点锁 §6.2.13、
-> pipe §6.2.14、console 读 §6.2.15），第 7 条的 **`close(2)` 已完成**
-> （§6.2.16）。**只剩 `open`/namei 一条**，而它被"没有可睡眠锁"卡住：
-> `vfs_namei()` 的后端 `lookup` 会做阻塞 ATAPI I/O，不能用自旋锁，
-> 只能靠 BKL 保证"查 name cache + 加 vnode 引用"的原子性；要摘必须先有
-> §5 的 turnstile（可睡眠锁），否则会和 `vn_free()` 抢同一个 vnode。
+> pipe §6.2.14、console 读 §6.2.15、`close(2)` §6.2.16、`open`/namei
+> §6.2.17）。第 7 条原本预计要上 turnstile，实际**没有引入新锁类型**：
+> 把"发布 lookup 结果 + 取 vnode 引用"合成为 `namecache_enter_unique()`
+> 一个原子动作后，路径级锁就不需要了（详见 §6.2.17）。
 > 注意：8 核基线里的 `smpuser` 一直把 `smp_user_dispatch` 打开，所以上面
 > 每一步的 8 核验证**都是在 AP 派发用户线程的前提下**跑出来的。
-> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**；`smp_user_dispatch`
-> 默认值仍为 0，等 §7.1 的数小时 soak。
+> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**；P1 仍未收口，
+> `smp_user_dispatch` 默认值还是 0，等 §7.1 的数小时 soak。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近
@@ -1021,14 +1102,20 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
    `spltty()` 屏蔽 IRQ）。写端仍未摘：`crt_row/crt_col`/`klog_len` 本来就没有
    锁，且 `panic()` 也走 `printf()`，给 `pccnputc()` 加锁必须先做"panic 无锁
    旁路"。
-7. **`close` / `open`**：**`close(2)` 已完成**（§6.2.16）：`fd_close()`
-   拆成 `fd_close_common(fd, bklfree)`，`fd_lock` 内认领描述符并取出
-   `vp/pipeidx/rw` 到局部，放锁后 `pipe_lock` 计账 + `vn_put()`，在 BKL 外
-   执行。`exec` 清扫与 `dup2` 仍传 0（后者"关掉再立刻重写同一槽位"，
-   中途放锁会被别的核抢走）。**`open` 未做**：主体是 `vfs_namei()`，整条路径
-   不持锁、靠 BKL，要摘必须先做**namei 路径级锁**（把"查 name cache + 加
-   vnode 引用"合成一个原子动作），否则会和 `vn_free()` 抢同一个 vnode
-   （复活已释放 vnode）。这是下一步。
+7. **`close` / `open`** ✅ 两条都已完成：
+   - **`close(2)`**（§6.2.16）：`fd_close()` 拆成
+     `fd_close_common(fd, bklfree)`，`fd_lock` 内认领描述符并取出
+     `vp/pipeidx/rw` 到局部，放锁后 `pipe_lock` 计账 + `vn_put()`，在 BKL 外
+     执行。`exec` 清扫与 `dup2` 传 0（后者"关掉再立刻重写同一槽位"，
+     中途放锁会被别的核抢走）。
+   - **`open(2)` / namei**（§6.2.17）：路径级锁**没有引入**——
+     `namecache_enter_unique()` 把"查到就复用 / 查不到就插入"和取引用
+     合成一个 `vfs_lock -> nc_lock` 临界区，命中侧 `namecache_lookup()`
+     本来就是这个形状；再补上 ISO9660 的静态扇区缓冲（改成就地解析
+     `bread()` 的块）、tmpfs lookup 的槽重新校验、错误路径的引用泄漏、
+     以及 fd 表所有槽位认领/引用拷贝的 `fd_lock`。`open_resolve()` 在
+     `vfs_namei_bklfree()` 为真（根为 ISO9660/tmpfs）时放掉 BKL，
+     JLFS/FFS 仍留在 BKL 内。
 
 配套要做的事：
 - **P1 仍未收口**：`smp_user_dispatch` 默认值还是 0。要改成 1，需要一次

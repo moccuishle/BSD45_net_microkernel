@@ -19,7 +19,18 @@ extern int bcmp(const void *, const void *, unsigned);
 #define	ISO_SECTOR	2048
 #define	ISO_ROOT_REC	156	/* offset of the root directory record in the PVD */
 
-static unsigned char	secbuf[ISO_SECTOR];
+/*
+ * No file-scope sector buffer.  Directory scans used to read through one, so
+ * two concurrent lookups (namei() without the BKL, §7.2.1 item 7) would have
+ * overwritten each other's records and could have returned a vnode for the
+ * wrong extent.  The scans now parse the block in place in the buffer cache:
+ * bread() pins it for the duration of one sector, which is exactly the
+ * lifetime the record walk needs, and costs no copy and no stack buffer.
+ * 中文：不再用文件级扇区缓冲。目录扫描以前经它中转，两个并发 lookup（摘掉 BKL 的
+ * namei，§7.2.1 第 7 条）会互相覆盖记录，甚至可能返回错误 extent 的 vnode。现在直接
+ * 就地在缓冲缓存里解析：bread() 把该块固定到本轮扫描结束，正是记录遍历需要的生命
+ * 周期，且既不用拷贝也不占栈。
+ */
 static unsigned		root_lba, root_size;
 static int		mounted;
 
@@ -100,8 +111,8 @@ name_eq(const unsigned char *nm, int nlen, const char *want)
 /*
  * Find `want' in the directory at (lba, size); fill in the record fields.
  */
-/* EN: Scans the directory extent at lba for size bytes sector by sector via iso_readsec and, on a name_eq match, fills *rlba, *rsize and *rflags from the record; returns 0, else -1. */
-/* 中文：用 iso_readsec 逐扇区读取 lba 处 size 字节的目录区，匹配 name_eq 后从记录中取出块号、大小与标志填入 *rlba/*rsize/*rflags，命中返回 0，否则 -1。 */
+/* EN: Scans the directory extent at lba for size bytes sector by sector, parsing each bread()ed block in place and brelse()ing it after the record walk; on a name_eq match fills *rlba, *rsize and *rflags; returns 0, else -1. */
+/* 中文：逐扇区扫描 lba 处 size 字节的目录区，就地在 bread() 得到的块里解析并在一轮记录遍历后 brelse；匹配 name_eq 后取出块号、大小与标志填入 *rlba/*rsize/*rflags，命中返回 0，否则 -1。 */
 static int
 find_in_dir(unsigned lba, unsigned size, const char *want, unsigned *rlba,
     unsigned *rsize, int *rflags)
@@ -109,27 +120,34 @@ find_in_dir(unsigned lba, unsigned size, const char *want, unsigned *rlba,
 	unsigned off, pos;
 
 	for (off = 0; off < size; off += ISO_SECTOR) {
-		if (iso_readsec(lba + off / ISO_SECTOR, secbuf) < 0)
+		struct buf *bp;
+		unsigned char *sec;
+
+		bp = bread(BDEV_CD, lba + off / ISO_SECTOR);
+		if (bp == 0)
 			return (-1);
+		sec = buf_data(bp);
 		pos = 0;
 		while (pos + 33 < ISO_SECTOR) {
-			int len = secbuf[pos];
+			int len = sec[pos];
 			int nlen;
 
 			if (len == 0)
 				break;		/* rest of the sector is padding */
 			if (pos + len > ISO_SECTOR)
 				break;
-			nlen = secbuf[pos + 32];
+			nlen = sec[pos + 32];
 			if (nlen > 0 && pos + 33 + nlen <= ISO_SECTOR &&
-			    name_eq(secbuf + pos + 33, nlen, want)) {
-				*rlba = le32(secbuf + pos + 2);
-				*rsize = le32(secbuf + pos + 10);
-				*rflags = secbuf[pos + 25];
+			    name_eq(sec + pos + 33, nlen, want)) {
+				*rlba = le32(sec + pos + 2);
+				*rsize = le32(sec + pos + 10);
+				*rflags = sec[pos + 25];
+				brelse(bp);
 				return (0);
 			}
 			pos += len;
 		}
+		brelse(bp);
 	}
 	return (-1);
 }
@@ -139,20 +157,25 @@ find_in_dir(unsigned lba, unsigned size, const char *want, unsigned *rlba,
 int
 iso_mount(void)
 {
+	struct buf *bp;
+	unsigned char *sec;
 
 	if (!atapi_present())
 		return (-1);
-	if (iso_readsec(16, secbuf) < 0) {
+	bp = bread(BDEV_CD, 16);
+	if (bp == 0) {
 		printf("isofs: sector 16 read failed\n");
 		return (-1);
 	}
-
-	if (secbuf[0] != 1 || bcmp(secbuf + 1, "CD001", 5) != 0) {
+	sec = buf_data(bp);
+	if (sec[0] != 1 || bcmp(sec + 1, "CD001", 5) != 0) {
 		printf("isofs: not a primary volume descriptor\n");
+		brelse(bp);
 		return (-1);
 	}
-	root_lba = le32(secbuf + ISO_ROOT_REC + 2);
-	root_size = le32(secbuf + ISO_ROOT_REC + 10);
+	root_lba = le32(sec + ISO_ROOT_REC + 2);
+	root_size = le32(sec + ISO_ROOT_REC + 10);
+	brelse(bp);
 	if (root_lba == 0 || root_size == 0)
 		return (-1);
 	mounted = 1;
@@ -280,24 +303,34 @@ iso_readdir(unsigned lba, unsigned size, unsigned *posp, char *name,
 	int len, nlen, i, j;
 
 	while (pos < size) {
-		if (iso_readsec(lba + pos / ISO_SECTOR, secbuf) < 0)
+		struct buf *bp;
+		unsigned char *sec;
+
+		/* records never cross a sector, so one bread() covers the walk */
+		bp = bread(BDEV_CD, lba + pos / ISO_SECTOR);
+		if (bp == 0)
 			return (-1);
-		rec = secbuf + (pos % ISO_SECTOR);
+		sec = buf_data(bp);
+		rec = sec + (pos % ISO_SECTOR);
 		len = rec[0];
 		if (len == 0) {			/* padding to the next sector */
+			brelse(bp);
 			pos = (pos / ISO_SECTOR + 1) * ISO_SECTOR;
 			continue;
 		}
 		if ((pos % ISO_SECTOR) + len > ISO_SECTOR) {
+			brelse(bp);
 			pos = (pos / ISO_SECTOR + 1) * ISO_SECTOR;
 			continue;
 		}
 		nlen = rec[32];
 		if (nlen == 1 && (rec[33] == 0 || rec[33] == 1)) {
+			brelse(bp);
 			pos += len;		/* "." and ".." */
 			continue;
 		}
 		if (nlen <= 0 || nlen > 48) {
+			brelse(bp);
 			pos += len;
 			continue;
 		}
@@ -317,6 +350,7 @@ iso_readdir(unsigned lba, unsigned size, unsigned *posp, char *name,
 		*elba = le32(rec + 2);
 		*esize = le32(rec + 10);
 		*eflags = rec[25];
+		brelse(bp);
 		*posp = pos + len;
 		return (0);
 	}

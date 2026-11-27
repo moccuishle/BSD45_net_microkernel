@@ -10,6 +10,9 @@
  * hint.  namecache_lookup() validates vp->v_id and only then bumps vp->ref,
  * so a stale entry can never resurrect a freed vnode slot.  Lookup results
  * are entered by vfs_namei(); create/remove/rename purge the affected name.
+ * namecache_enter_unique() is the same validation plus the insert, in one
+ * critical section: it is what guarantees one vnode per (directory, name)
+ * when namei() runs on several CPUs without the BKL (§7.2.1 item 7).
  *
  * Layer rule: this file only touches struct vnode (its v_id, ref) and the
  * vnode pool's id allocator, never the process table or a backend.
@@ -51,12 +54,13 @@ static unsigned nc_hits, nc_misses;
  * P2: name-cache table lock.  It covers nc[], the hash buckets, the LRU and
  * the hit/miss counters, and never spans a backend call.
  * Lock order: vfs_lock -> nc_lock.  vn_free() purges the name cache from
- * inside the pool lock, and namecache_lookup() has to bump vp->ref while the
- * entry it validated is still valid, so it takes the pool lock first and
- * calls vn_ref_locked().  Entry filling (namecache_enter/purge) only needs
- * nc_lock: v_id reads there are hints, and lookup revalidates them.
+ * inside the pool lock, and both namecache_lookup() and
+ * namecache_enter_unique() have to bump vp->ref while the entry they
+ * validated is still valid, so they take the pool lock first and call
+ * vn_ref_locked().  Entry removal (purge) only needs nc_lock: the v_id reads
+ * there are hints, and lookup revalidates them.
  */
-/* 中文：P2 名字缓存表锁：保护表项、哈希桶、LRU 与计数，不跨越后端调用。锁序 vfs_lock -> nc_lock：vn_free() 在池锁内清理本缓存，而 lookup 需在表项仍有效时递增引用，故先取池锁再调 vn_ref_locked()；enter/purge 只需 nc_lock，其中的 v_id 读取只作提示，lookup 会重新校验。 */
+/* 中文：P2 名字缓存表锁：保护表项、哈希桶、LRU 与计数，不跨越后端调用。锁序 vfs_lock -> nc_lock：vn_free() 在池锁内清理本缓存，而 lookup/enter_unique 需在表项仍有效时递增引用，故先取池锁再调 vn_ref_locked()；purge 只需 nc_lock，其中的 v_id 读取只作提示，lookup 会重新校验。 */
 static struct spinlock nc_lock;
 
 /* EN: Hashes a directory v_id and entry name into a name-cache bucket: starts at dv_id*31, folds each name byte as h*33+c, and returns the sum modulo NCHASH. */
@@ -253,26 +257,69 @@ namecache_lookup(struct vnode *dv, const char *name)
 	return (vp);
 }
 
-/* EN: Maps (dv, name) to vp: refreshes an existing entry in place, else takes a free slot or evicts the LRU head, then hashes and appends it; names of NC_NAMELEN or more are ignored. */
-/* 中文：把 (dv, name) 映射到 vp：已有表项则原地刷新，否则取空闲槽或淘汰 LRU 表头，再插入哈希链与 LRU 尾；名字长度达到 NC_NAMELEN 则忽略。 */
-void
-namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
+/*
+ * S-§7.2.1 item 7: find-or-insert, atomically.
+ *
+ * Plain "insert vp for (dv, name)" is not enough once namei() runs without
+ * the BKL: two CPUs can miss the same name, each call the backend, and each
+ * come back with its own vnode for one file.  Both would then live in the
+ * descriptor table, the name cache would remember whichever entered last,
+ * and the two vnodes would get different page-cache keys -- two handles to
+ * one file that do not see each other's data.  So the entry point both
+ * publishes the result and decides who owns the name, in one critical
+ * section:
+ *
+ *   - a *valid* entry for (dv, name) already exists -> bump its reference
+ *     and return it; the caller drops its own vnode;
+ *   - otherwise insert vp and return vp (the caller's reference is the one
+ *     the cache and the caller now share, exactly like a lookup hit).
+ *
+ * Meaning of the return value: always a referenced vnode.  When it is not
+ * vp the caller must vn_put(vp).
+ *
+ * A stale entry (vnode slot recycled, v_id no longer matches) is dropped
+ * first, so this can never resurrect a freed vnode.
+ */
+/* 中文：§7.2.1 第 7 条：原子地"查到就复用、查不到就插入"。namei 摘掉 BKL 后，
+ * 两个核可能同时 miss 同一个名字、各自调后端、各自拿到一个属于同一文件的 vnode；
+ * 两个 vnode 都会留在描述符表里，名字缓存只记得后插入的那个，而两者的页缓存键
+ * 不同——同一个文件有两个互相看不到对方数据的句柄。所以入口在同一个临界区里
+ * 既发布结果又决定名字归谁：已有有效表项则递增引用并返回它，调用者丢掉自己的
+ * vnode；否则插入 vp 并返回 vp。返回值恒为已加引用的 vnode，不等于 vp 时调用者
+ * 必须 vn_put(vp)。过期表项（槽已回收、v_id 不符）先删除，绝不会复活已释放的
+ * vnode。 */
+struct vnode *
+namecache_enter_unique(struct vnode *dv, const char *name, struct vnode *vp)
 {
 	int i, n, len;
+	struct vnode *have;
 
-	if (!nc_inited || dv == 0 || vp == 0 || name == 0 || name[0] == 0)
-		return;
+	if (dv == 0 || vp == 0 || name == 0 || name[0] == 0)
+		return (vp);
 	len = strlen(name);
-	if (len >= NC_NAMELEN)
-		return;
+	if (!nc_inited || len >= NC_NAMELEN)
+		return (vp);		/* uncacheable: the caller keeps its vnode */
+	/*
+	 * Pool lock first (fixed order): it keeps the slot from being freed or
+	 * recycled between the v_id check and vn_ref_locked(), and nc_drop()
+	 * below may be the last user of that v_id.
+	 * 中文：先取池锁（固定锁序）：保证 v_id 校验与 vn_ref_locked() 之间槽不会被
+	 * 释放或回收，因为下面的 nc_drop() 可能就是该 v_id 的最后一个使用者。
+	 */
+	vfs_pool_lock();
 	spin_lock(&nc_lock);
 	if ((i = nc_find(dv->v_id, name)) >= 0) {
-		nc[i].vp = vp;
-		nc[i].v_id = vp->v_id;
-		nc_lru_remove(i);
-		nc_lru_append(i);
-		spin_unlock(&nc_lock);
-		return;
+		have = nc[i].vp;
+		if (have != 0 && have->v_id != 0 &&
+		    have->v_id == nc[i].v_id) {
+			nc_lru_remove(i);
+			nc_lru_append(i);
+			vn_ref_locked(have);
+			spin_unlock(&nc_lock);
+			vfs_pool_unlock();
+			return (have);
+		}
+		nc_drop(i);
 	}
 	/* free slot first, then the oldest live entry */
 	for (i = 0; i < NCACHE; i++)
@@ -282,7 +329,8 @@ namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
 		i = nc_lru_head;
 		if (i < 0) {
 			spin_unlock(&nc_lock);
-			return;
+			vfs_pool_unlock();
+			return (vp);
 		}
 		nc_drop(i);
 	}
@@ -296,6 +344,8 @@ namecache_enter(struct vnode *dv, const char *name, struct vnode *vp)
 	nc_hash_insert(n);
 	nc_lru_append(n);
 	spin_unlock(&nc_lock);
+	vfs_pool_unlock();
+	return (vp);
 }
 
 /* EN: Drops the one cache entry matching directory v_id and name via nc_drop; does nothing when the cache is uninitialized or the name is not cached. */
