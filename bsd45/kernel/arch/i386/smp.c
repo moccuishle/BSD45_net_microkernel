@@ -427,8 +427,10 @@ void
 spin_init(struct spinlock *lk)
 {
 
-	if (lk != 0)
+	if (lk != 0) {
 		lk->locked = 0;
+		lk->holder = -1;
+	}
 }
 
 /* EN: Acquire a spinlock with a pause loop. */
@@ -436,6 +438,8 @@ void
 spin_lock(struct spinlock *lk)
 {
 	int prev;
+	unsigned spins = 0;
+	static volatile int spin_stuck;	/* probe: report a wedged lock once */
 
 	if (lk == 0)
 		return;
@@ -445,7 +449,32 @@ spin_lock(struct spinlock *lk)
 		    : "=r" (prev) : "m" (lk->locked), "0" (1) : "memory");
 		if (prev == 0) {
 			preempt_disable();	/* hold lock => no preemption */
+			lk->holder = cpu_id();
 			return;			/* acquired */
+		}
+		/*
+		 * PROBE (temporary): a lock that is never released wedges every
+		 * CPU that needs it - with interrupts off, so the machine goes
+		 * silent and nothing gets logged.  Say who holds it instead of
+		 * spinning forever in the dark.  The counter is per call, so a
+		 * normal contended lock never reaches it.
+		 * 探针：永不释放的锁会把每个需要它的核卡死（且关中断），整机静默、
+		 * 什么日志都没有。这里把持有者打出来，而不是在黑暗里无限自旋。
+		 */
+		if (++spins == 20000000) {
+			/*
+			 * Never print twice: if the wedged lock *is* the console
+			 * lock, the printf below would recurse into this same
+			 * loop, and a second print would recurse again forever.
+			 * The flag is set before the call so the inner entry
+			 * spins instead of recursing.
+			 */
+			if (!spin_stuck) {
+				spin_stuck = 1;
+				printf("spin: lock %p stuck, held by cpu %d, "
+				    "cpu %d waiting\n", lk, lk->holder, cpu_id());
+			}
+			spins = 0;
 		}
 		__asm __volatile("pause");	/* spin hint */
 	}
@@ -457,6 +486,7 @@ spin_unlock(struct spinlock *lk)
 {
 
 	if (lk != 0) {
+		lk->holder = -1;
 		lk->locked = 0;
 		preempt_enable();	/* released lock => preemption allowed */
 	}

@@ -219,6 +219,8 @@ kthread_reap(struct kthread *leaving)
 		 * bzero the TCB and the 16 KB stack safely.
 		 */
 		tid = t->t_tid;
+		/* S432: see kthread_user_free() - never publish a queued slot */
+		kthread_rq_detach(t);
 		t->t_reap_cpu = -1;
 		t->t_oncpu = -1;
 		t->t_state = KT_FREE;
@@ -624,6 +626,21 @@ kthread_user_free(struct kthread *t)
 
 	if (t == 0)
 		return;
+	/*
+	 * S432: get the TCB off every run queue BEFORE the slot is published
+	 * for reuse.  tcb_reserve() hands the slot to kthread_user_spawn(),
+	 * which bzeroes it; a bzeroed t_runq pointer inside a run-queue chain
+	 * cuts the list in half, and every TCB behind it becomes unreachable
+	 * while the CPU that owns the list goes idle - the queue still looks
+	 * non-empty (sc_nrun > 0) so nothing ever repairs it.  That was the
+	 * "KT_RUN, rq 0, pstate P_RUN, never dispatched" hang.
+	 * S432：必须在槽位被复用之前把 TCB 从所有运行队列摘掉。tcb_reserve()
+	 * 会把槽位交给 kthread_user_spawn() 并 bzero 它；队列链里一旦出现被清零
+	 * 的 t_runq，链表就被拦腰截断，其后的 TCB 全部不可达，而属主核空转——
+	 * sc_nrun 仍大于 0，看起来队列非空，没有任何路径会去修它。这正是
+	 * "KT_RUN / rq 0 / pstate P_RUN 却永远不被派发" 的那个挂死。
+	 */
+	kthread_rq_detach(t);
 	/* KLT: unlink from the owning process's thread list */
 	if (t->t_proc != 0) {
 		for (pp = &t->t_proc->uk_p_threads; *pp != 0;
@@ -700,6 +717,109 @@ kthread_block(void)
 	sched_on_block(t);		/* start sleep-length accounting */
 	t->t_state = KT_BLOCK;
 	hal_switch_stack(&t->t_ksp, sched_esp[cpu_id()]);
+}
+
+/*
+ * kthread_block_prepare - publish KT_BLOCK for the current kernel thread
+ * without switching away yet.
+ *
+ * kthread_block() tests nothing, so "check the condition, then block" is a
+ * lost-wakeup race: a waker that runs in between calls kthread_wake(), sees
+ * KT_RUN, does nothing, and the thread then sleeps with the work pending.
+ * A caller that holds the lock protecting its condition can close the window
+ * by publishing KT_BLOCK *inside* that lock - any waker taking the lock
+ * afterwards sees KT_BLOCK and its wake lands.  Drop the lock, then call
+ * kthread_block_commit() to actually switch away.
+ * 中文：kthread_block() 不做检查，所以"先判条件、再阻塞"必然有丢唤醒窗口：
+ * 唤醒者挤在中间调用 kthread_wake()，看到的是 KT_RUN，什么也不做，线程随后
+ * 带着待办睡下。持有"条件锁"的调用者在锁内先发布 KT_BLOCK 就能合上这个窗口
+ * ——之后取到该锁的唤醒者一定看到 KT_BLOCK，唤醒不会丢。放锁后再调用
+ * kthread_block_commit() 真正切栈。
+ */
+void
+kthread_block_prepare(void)
+{
+	struct kthread *t = curk;
+
+	if (t == 0)
+		return;
+	rq_dequeue(t);			/* blocked TCB leaves the run queue */
+	sched_on_block(t);		/* start sleep-length accounting */
+	t->t_state = KT_BLOCK;
+}
+
+/* EN: Second half of kthread_block_prepare(): switch off the stack. */
+void
+kthread_block_commit(void)
+{
+	struct kthread *t = curk;
+
+	if (t == 0)
+		return;
+	hal_switch_stack(&t->t_ksp, sched_esp[cpu_id()]);
+}
+
+/*
+ * kthread_report_invisible - print any thread that is runnable but on no run
+ * queue at all.
+ *
+ * A TCB in KT_RUN must sit on exactly one queue (t_onrq for kernel threads,
+ * t_runq_cpu >= 0 for user threads).  If it sits on neither, no CPU will ever
+ * pick it: the process is alive, its syscall never returns, and nothing in the
+ * machine looks wrong.  Called from the idle path, which is precisely the
+ * state such a machine is in.
+ * 中文：KT_RUN 的 TCB 必须待在且只待在一个队列上（内核线程看 t_onrq，用户
+ * 线程看 t_runq_cpu >= 0）。两者都不满足，就没有任何核会取它：进程还在、
+ * 系统调用永不返回，整机看起来却完全正常。空闲路径正是这种机器的状态，
+ * 所以在那里扫描。
+ */
+int
+kthread_report_invisible(void)
+{
+	int i, found = 0;
+
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used || t == curk)
+			continue;
+		if (t->t_state != KT_RUN)
+			continue;
+		if (t->t_onrq || t->t_runq_cpu >= 0)
+			continue;
+		printf("sched: tid %d pid %d is RUN but on no queue "
+		    "(oncpu %d wchan %p prio %d)\n", t->t_tid,
+		    t->t_proc != 0 ? t->t_proc->uk_pid : -1, t->t_oncpu,
+		    t->t_wchan, t->t_curprio);
+		found++;
+		if (found >= 8)
+			break;
+	}
+	return (found);
+}
+
+/* EN: Dump every live TCB; used by the idle-path deadlock probe. */
+void
+kthread_dump_all(const char *why)
+{
+	int i;
+
+	printf("kthread dump (%s): ncpu %d\n", why, ncpu);
+	for (i = 0; i < nkthread; i++) {
+		struct kthread *t = &kthreads[i];
+
+		if (!t->t_used)
+			continue;
+		printf("  tid %d pid %d %-10s state %d oncpu %d rq %d"
+		    " pstate %d nthr %d join %d wchan %p%s\n", t->t_tid,
+		    t->t_proc != 0 ? t->t_proc->uk_pid : -1,
+		    t->t_name != 0 ? t->t_name : "?", t->t_state, t->t_oncpu,
+		    t->t_runq_cpu,
+		    t->t_proc != 0 ? t->t_proc->uk_state : -1,
+		    t->t_proc != 0 ? t->t_proc->uk_p_nthreads : -1,
+		    t->t_join_tid, t->t_wchan,
+		    t == curk ? " <running>" : "");
+	}
 }
 
 /* 中文：唤醒处于阻塞状态的线程，将其状态改回 KT_RUN */

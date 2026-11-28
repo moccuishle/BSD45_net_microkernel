@@ -428,6 +428,10 @@ static struct kthread	per_cpu_idle[MAXCPU];	/* AP carriers, not pooled */
 static struct kthread	*ps_mt[MAXCPU];
 /* S413: print one per-CPU summary each time the machine goes idle again. */
 static int		idle_reported;
+/* PROBE (temporary): idle-loop counter for the invisible-thread scan. */
+static unsigned	idle_checks;
+static unsigned	idle_tick_start;
+static int	idle_dumped;
 
 #define	cur		(sched_cpu[cpu_id()].sc_cur)
 #define	cur_thread	(sched_cpu[cpu_id()].sc_curthread)
@@ -536,35 +540,128 @@ sched_rq_put(struct kthread *t, int cpu)
 	spin_unlock(&sc->sc_rqlock);
 }
 
+/*
+ * sched_rq_put_home - requeue a TCB on the queue of the CPU that owns it.
+ *
+ * sched_rq_pick() refuses a TCB owned by another CPU, so a TCB put back on the
+ * *caller's* queue after a lost claim is on a queue nobody will ever scan for
+ * it: its owner does not have it and every other picker skips it.  Every
+ * requeue of a TCB that may already be owned must therefore go home.
+ * 中文：sched_rq_pick() 会跳过属主为别核的 TCB，所以"领失败后塞回调用者自己
+ * 的队列"等于把它放进一个永远不会被扫描的队列：属主队列里没有它，其他核又
+ * 跳过它。凡是将可能已有属主的 TCB 重新入队，都必须放回属主队列。
+ */
+static void
+sched_rq_put_home(struct kthread *t, int fallback)
+{
+	int cpu = fallback;
+
+	if (t != 0 && t->t_oncpu >= 0 && t->t_oncpu < MAXCPU &&
+	    sched_cpu[t->t_oncpu].sc_online)
+		cpu = t->t_oncpu;
+	sched_rq_put(t, cpu);
+}
+
 static void
 sched_rq_del(struct kthread *t)
 {
 	struct sched_cpu *sc;
 	struct kthread *p, *prev;
-	int cpu;
+	int cpu, tries;
 
-	if (t == 0 || (cpu = t->t_runq_cpu) < 0)
+	if (t == 0)
 		return;
-	if (cpu >= MAXCPU)
-		cpu = 0;
-	sc = &sched_cpu[cpu];
-	spin_lock(&sc->sc_rqlock);
-	for (p = sc->sc_rqhead, prev = 0; p != 0; prev = p, p = p->t_runq) {
-		if (p != t)
+	/*
+	 * S432: t_runq_cpu is read before the queue lock is taken, so the
+	 * value may be stale by the time we hold the lock: another CPU can
+	 * have dequeued the TCB (setting it to -1) or re-queued it on a
+	 * different CPU in that window.  Unlinking "by the number we read
+	 * earlier" then walks the wrong list, finds nothing, and still
+	 * clears t_runq_cpu - the TCB stays chained in the real list while
+	 * claiming to be nowhere, or vice versa.  Re-read the owner under
+	 * the lock and retry if it moved.
+	 * S432：t_runq_cpu 是在拿队列锁之前读的，等真正拿到锁时它可能已经过时——
+	 * 另一个核可能刚把它摘掉（置 -1）或改排到别的核。按"旧号码"摘除会走错
+	 * 链表、找不到、却仍然把 t_runq_cpu 清零，于是 TCB 实际仍挂在原链表里，
+	 * 却对外宣称不在任何队列上。这里在锁内复核归属，变了就重来。
+	 */
+	for (tries = 0; tries < 4; tries++) {
+		cpu = t->t_runq_cpu;
+		if (cpu < 0)
+			return;
+		if (cpu >= MAXCPU)
+			cpu = 0;
+		sc = &sched_cpu[cpu];
+		spin_lock(&sc->sc_rqlock);
+		if (t->t_runq_cpu != cpu) {	/* moved: re-read and retry */
+			spin_unlock(&sc->sc_rqlock);
 			continue;
-		if (prev != 0)
-			prev->t_runq = t->t_runq;
-		else
-			sc->sc_rqhead = t->t_runq;
-		if (sc->sc_rqtail == t)
-			sc->sc_rqtail = prev;
-		if (sc->sc_nrun > 0)
-			sc->sc_nrun--;
-		break;
+		}
+		for (p = sc->sc_rqhead, prev = 0; p != 0;
+		     prev = p, p = p->t_runq) {
+			if (p != t)
+				continue;
+			if (prev != 0)
+				prev->t_runq = t->t_runq;
+			else
+				sc->sc_rqhead = t->t_runq;
+			if (sc->sc_rqtail == t)
+				sc->sc_rqtail = prev;
+			if (sc->sc_nrun > 0)
+				sc->sc_nrun--;
+			break;
+		}
+		t->t_runq = 0;
+		t->t_runq_cpu = -1;
+		spin_unlock(&sc->sc_rqlock);
+		return;
 	}
-	t->t_runq = 0;
-	t->t_runq_cpu = -1;
-	spin_unlock(&sc->sc_rqlock);
+}
+
+/* EN: Queue-detach entry point for the TCB free path (see kthread.h). */
+void
+kthread_rq_detach(struct kthread *t)
+{
+
+	sched_rq_del(t);
+}
+
+/*
+ * PROBE (temporary): print what each CPU's run queue actually contains, and
+ * compare it with sc_nrun.  A TCB whose t_runq_cpu names a CPU but which is
+ * not reachable from that CPU's head is invisible to the picker even though
+ * every state field says "runnable" - this makes that difference visible
+ * instead of inferred.
+ * 探针：打印每个核运行队列的真实内容，并与 sc_nrun 对照。若某 TCB 的
+ * t_runq_cpu 指向某核、却不在该核的链表里，那么所有状态字段都说"可运行"，
+ * 调度器却永远取不到它——这里把"以为在队列里"和"真在队列里"的差别打出来。
+ */
+static void
+sched_dump_queues(void)
+{
+	int c, n;
+	struct kthread *p;
+
+	for (c = 0; c < MAXCPU; c++) {
+		struct sched_cpu *sc = &sched_cpu[c];
+
+		if (!sc->sc_online)
+			continue;
+		printf("  cpu%d nrun %d head %d:", c, sc->sc_nrun,
+		    sc->sc_rqhead != 0 ? sc->sc_rqhead->t_tid : -1);
+		n = 0;
+		for (p = sc->sc_rqhead; p != 0 && n < 16; p = p->t_runq, n++)
+			printf(" %d", p->t_tid);
+		if (p != 0)
+			printf(" ...");
+		printf("\n");
+	}
+	for (c = 0; c < nkthread; c++) {
+		p = &kthreads[c];
+		if (p->t_used && p->t_state == KT_RUN && p->t_runq_cpu >= 0)
+			printf("  runs-on cpu%d claim: tid %d\n",
+			    p->t_runq_cpu, p->t_tid);
+	}
 }
 
 /*
@@ -650,6 +747,33 @@ sched_rq_sweep(int cid)
 		if (!t->t_used)
 			continue;
 		if (t->t_state == KT_RUN && t->t_proc != 0) {
+			/*
+			 * S432: a KT_RUN TCB must sit on the queue of the CPU
+			 * that owns it - sched_rq_pick() refuses a TCB owned by
+			 * another CPU.  A TCB left on the wrong queue is
+			 * therefore invisible to everyone: its owner's queue
+			 * does not have it and every other picker skips it.
+			 * That is exactly how the aio child wedged: picked from
+			 * cpu0's queue, claim lost to cpu4, requeued on cpu0.
+			 * Move it home and wake the owner.
+			 * S432：KT_RUN 的 TCB 必须待在属主核的队列上——
+			 * sched_rq_pick() 会跳过属主为别核的 TCB。排错队列就等于
+			 * 对所有人隐身：属主队列里没有它，其他核又跳过它。aio 子
+			 * 进程正是这样卡死的：从 cpu0 队列取走、领给 cpu4 失败、
+			 * 又塞回 cpu0。这里把它搬回属主并唤醒属主。
+			 */
+			if (t->t_runq_cpu >= 0 && t->t_oncpu >= 0 &&
+			    t->t_runq_cpu != t->t_oncpu &&
+			    t->t_oncpu < MAXCPU &&
+			    sched_cpu[t->t_oncpu].sc_online) {
+				int own = t->t_oncpu;
+
+				sched_rq_del(t);
+				sched_rq_put(t, own);
+				if (own != cid)
+					smp_resched_cpu(own);
+				continue;
+			}
 			if (t->t_runq_cpu < 0 && tcb_runnable(t))
 				sched_rq_put(t, cid);
 		} else if (t->t_runq_cpu >= 0)
@@ -1960,6 +2084,8 @@ static int uring_cqe_push(struct uring_ring *r, unsigned user_data, int res);
 
 static struct aio_slot	aios[NAIO];
 static int		aio_next_token;
+/* PROBE (temporary): completions that found the waiter awake. */
+static int		aio_probe;
 /*
  * S432: aio_slot handshake lock.
  *
@@ -2036,7 +2162,24 @@ aio_complete_kiocb(struct kiocb *ki, int r)
 		uring_wake(rg);
 		return;
 	}
-	softirq_defer(aio_soft, s);
+	/*
+	 * Call the completion directly instead of softirq_defer()ing it.
+	 *
+	 * The callback runs on the aio worker kernel thread (see
+	 * aio_worker()), i.e. ordinary process context holding no locks, so
+	 * there is nothing to defer *for*.  Deferring went through a 64-entry
+	 * ring that a) was touched by several CPUs without a lock and b)
+	 * silently dropped callbacks when full - a dropped completion strands
+	 * its waiter forever, which is a permanent hang with every CPU idle.
+	 * The ring stays for page reclaim, where a lost callback only delays
+	 * reclaim.
+	 * 直接调用完成回调，不再经 softirq_defer() 转投。回调本来就在 aio
+	 * worker 内核线程上执行（普通进程上下文、不持锁），没有任何"延后"的
+	 * 必要。而转投要经过一个 64 项环形队列：多核无锁写、满时静默丢弃——
+	 * 丢掉的完成会把等待者永久留在睡眠里（整机空转的死挂）。队列保留给
+	 * 页回收，那里丢一次只是推迟回收。
+	 */
+	aio_soft(s);
 }
 
 /* 中文：aio 完成软中断：找到等待该 token 的进程，把结果写入其 regs.eax、置为可运行并释放槽位；ring 完成不走此路 */
@@ -2077,6 +2220,20 @@ aio_soft(void *arg)
 		vn_put(s->a_ki.ki_vp);
 		s->a_used = 0;
 		s->a_woken = 1;
+	} else if (p != 0 && p->uk_aio_wait_token == s->a_token) {
+		/*
+		 * PROBE (temporary): the waiter still owns the token but is not
+		 * P_BLOCKED, so this completion wakes nobody.  Either the
+		 * waiter has not reached kthread_block_tcb() yet (the aio_lock
+		 * window) or its state was published too late - a permanent
+		 * hang either way.
+		 * 探针：等待者仍持有该 token 却不是 P_BLOCKED，本次完成不会唤醒
+		 * 任何人——要么它还没走到 kthread_block_tcb()，要么状态发布晚了，
+		 * 两者都会永久挂起。
+		 */
+		if (aio_probe++ < 8)
+			printf("aio: token %d done but pid %d state %d, not woken\n",
+			    s->a_token, s->a_pid, p->uk_state);
 	}
 	spin_unlock(&aio_lock);
 }
@@ -4065,6 +4222,8 @@ proc_sched(void)
 					smp_bkl_drop();
 					sched_cpu[cid].sc_switches++;
 					idle_reported = 0;	/* dispatched */
+					idle_tick_start = 0;
+					idle_dumped = 0;
 					/*
 					 * S428: this CPU is leaving the caller
 					 * (mt).  It is still KT_RUN, so it has
@@ -4074,7 +4233,7 @@ proc_sched(void)
 					 */
 					if (mt != 0 && mt != t &&
 					    mt->t_state == KT_RUN)
-						sched_rq_put(mt, cid);
+						sched_rq_put_home(mt, cid);
 					/* S424: release mt on the next entry */
 					sched_cpu[cid].sc_prev = mt;
 					sched_cpu[cid].sc_parked = 0;
@@ -4083,7 +4242,7 @@ proc_sched(void)
 				kthread_release_cpu(t);	/* sig_deliver killed it */
 			} else if (t != 0) {
 				/* S428: claim lost (or sig killed it): requeue */
-				sched_rq_put(t, cid);
+				sched_rq_put_home(t, cid);
 			}
 		}
 		if (me != 0 && mt != 0 && mt->t_state == KT_RUN &&
@@ -4153,6 +4312,35 @@ proc_sched(void)
 				idle_reported = 1;
 				if (cid == 0)
 					smp_print();
+			}
+			/*
+			 * PROBE (temporary): this CPU is about to sleep because it
+			 * found nothing to run.  If some thread is nonetheless
+			 * KT_RUN while sitting on no run queue, it is invisible to
+			 * every CPU and the work it belongs to hangs forever with
+			 * the machine looking perfectly healthy.  Say so.
+			 * 探针：本核因为找不到可运行者而准备睡眠。此时若仍有 TCB 处于
+			 * KT_RUN 却不在任何队列上，它对所有核都是隐身的，它所属的工作
+			 * 会永久挂起，而整机看起来毫无异常。这里把它打出来。
+			 */
+			if ((++idle_checks & 1023) == 0)
+				kthread_report_invisible();
+			/*
+			 * PROBE (temporary): nothing to run for two seconds while a
+			 * process exists means someone is never coming back.  Dump
+			 * every TCB once so the stuck one can be named (blocked?
+			 * queued on a CPU that never picks it? owner of a stack?).
+			 * 探针：还有进程存在却连续两秒无事可做，说明有谁再也回不来。
+			 * 打一次全量 TCB，指出卡住的到底是哪个（阻塞？排在没人取的
+			 * 队列上？还占着栈？）。
+			 */
+			if (idle_tick_start == 0)
+				idle_tick_start = clock_get_ticks();
+			if (!idle_dumped &&
+			    (unsigned)(clock_get_ticks() - idle_tick_start) > 200) {
+				idle_dumped = 1;
+				kthread_dump_all("idle >2s");
+				sched_dump_queues();
 			}
 			/*
 			 * S432: `sti; hlt` used to be inlined here; it is now
@@ -4618,7 +4806,7 @@ sched_tick(struct sysregs *r)
 			 * otherwise the candidate stays invisible until the
 			 * next repair sweep.
 			 */
-			sched_rq_put(t, cpu_id());
+			sched_rq_put_home(t, cpu_id());
 			return;			/* keep running current thread */
 		}
 	}
@@ -4643,7 +4831,7 @@ sched_tick(struct sysregs *r)
 	 */
 	if (!kthread_claim_cpu(t, cpu_id())) {
 		/* S428: lost the race for a queued thread - put it back */
-		sched_rq_put(t, cpu_id());
+		sched_rq_put_home(t, cpu_id());
 		if (me->t_tid == mp->uk_pid)
 			mp->uk_regs = *r;
 		else

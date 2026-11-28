@@ -14,6 +14,7 @@
  */
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/smp.h>
 
 #include "fs/vfs.h"
 #include "thread/kthread.h"
@@ -21,6 +22,23 @@
 static struct kiocb	*aio_head, *aio_tail;
 static struct kthread	*aio_worker_thread;
 static unsigned		aio_queued, aio_done, aio_pending;
+/* PROBE (temporary): submits that found the worker awake. */
+static int		aio_probe;
+/*
+ * The worker sleeps on "aio_head != 0".  Testing that condition and then
+ * calling kthread_block() left a window in which a submit ran kthread_wake()
+ * on a still-running worker, which ignored the wake, and the worker then
+ * slept with the request queued - an aio read that never completes, i.e. a
+ * process asleep forever with every CPU idle.  aio_q_lock closes it the same
+ * way aio_wait_sys() does: the condition is tested and KT_BLOCK published in
+ * one critical section.
+ * 中文：worker 睡在 "aio_head != 0" 上。先判条件再调 kthread_block() 留下了
+ * 窗口：提交方在中间调 kthread_wake()，此时 worker 仍是 KT_RUN，唤醒被忽略，
+ * worker 随后带着请求睡下——这次 aio 读永远不会完成，进程永久睡死、整机空转。
+ * 用 aio_q_lock 按 aio_wait_sys() 同样的办法合上：判条件与发布 KT_BLOCK 在
+ * 同一个临界区内完成。
+ */
+static struct spinlock	aio_q_lock;
 
 /* 中文：异步 I/O 工作线程主循环：从队列取出 kiocb，用同步后端执行读或写并在完成后调用其完成回调 */
 /* EN: Async I/O worker thread main loop: dequeue a kiocb, run the synchronous read/write backend and invoke its completion callback when done */
@@ -34,14 +52,27 @@ aio_worker(void *arg)
 		void (*cb)(struct kiocb *, int);
 		int r;
 
-		while (aio_head == 0)
-			kthread_block();
+		/*
+		 * Test the queue and publish KT_BLOCK as one atomic step
+		 * against vfs_submit_async(); otherwise a submit landing in
+		 * between is lost and we sleep with work queued.
+		 * 判空与发布 KT_BLOCK 相对 vfs_submit_async() 是一个原子动作，
+		 * 否则夹在中间的提交会丢，我们带着待办睡下。
+		 */
+		spin_lock(&aio_q_lock);
+		if (aio_head == 0) {
+			kthread_block_prepare();
+			spin_unlock(&aio_q_lock);
+			kthread_block_commit();
+			continue;
+		}
 		ki = aio_head;
 		aio_head = ki->ki_next;
 		if (aio_head == 0)
 			aio_tail = 0;
 		ki->ki_next = 0;
 		aio_pending--;
+		spin_unlock(&aio_q_lock);
 		ki->ki_state = KI_ACTIVE;
 
 		cb = ki->ki_complete;
@@ -71,6 +102,14 @@ vfs_submit_async(struct kiocb *ki)
 		return (-EINVAL);
 	ki->ki_state = KI_QUEUED;
 	ki->ki_next = 0;
+	/*
+	 * Enqueue under the same lock the worker tests the queue with, so
+	 * either it sees this request before it blocks, or it is already
+	 * KT_BLOCK and the wake below lands.
+	 * 与 worker 判空用同一把锁入队：要么它在阻塞前看到这条请求，要么它已是
+	 * KT_BLOCK，下面的唤醒一定生效。
+	 */
+	spin_lock(&aio_q_lock);
 	if (aio_tail != 0)
 		aio_tail->ki_next = ki;
 	else
@@ -78,8 +117,20 @@ vfs_submit_async(struct kiocb *ki)
 	aio_tail = ki;
 	aio_queued++;
 	aio_pending++;
-	if (aio_worker_thread != 0)
+	spin_unlock(&aio_q_lock);
+	if (aio_worker_thread != 0) {
 		kthread_wake(aio_worker_thread);
+		/*
+		 * PROBE (temporary): a wake that left the worker blocked with
+		 * work queued is exactly the lost-wakeup hang; say so instead
+		 * of letting the box go quiet.
+		 * 探针：唤醒后 worker 仍阻塞且队列非空，就是丢唤醒挂起的现场。
+		 */
+		if (aio_worker_thread->t_state == KT_BLOCK && aio_head != 0 &&
+		    aio_probe++ < 8)
+			printf("aio: worker blocked with %u queued after wake\n",
+			    aio_pending);
+	}
 	return (EIOCBQUEUED);
 }
 
@@ -91,6 +142,7 @@ vfs_aio_init(void)
 
 	aio_head = aio_tail = 0;
 	aio_queued = aio_done = aio_pending = 0;
+	spin_init(&aio_q_lock);
 	aio_worker_thread = kthread_spawn("aio", aio_worker, 0);
 	if (aio_worker_thread == 0)
 		printf("aio: no worker thread\n");

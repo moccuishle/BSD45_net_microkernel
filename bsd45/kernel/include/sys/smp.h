@@ -101,7 +101,7 @@ void	lapic_send_ipi(int target, int vector);
 #define	IPI_STOP		0x42
 
 /* spinlock (test-and-set) */
-struct spinlock { volatile int locked; };
+struct spinlock { volatile int locked; volatile int holder; };
 void	spin_init(struct spinlock *lk);
 void	spin_lock(struct spinlock *lk);
 void	spin_unlock(struct spinlock *lk);

@@ -206,6 +206,10 @@ void	kthread_reap(struct kthread *leaving);
 int	kstack_overflowed(struct kthread *t);
 void	kthread_exit(void);
 void	kthread_block(void);
+int	kthread_report_invisible(void);
+void	kthread_dump_all(const char *why);
+void	kthread_block_prepare(void);
+void	kthread_block_commit(void);
 void	kthread_wake(struct kthread *t);
 void	kthread_poll(void);	/* run one runnable kernel thread */
 void	kthread_run(void);	/* run until none are runnable */
@@ -239,6 +243,17 @@ void	preempt_enable(void);	/* may schedule when count drops to 0 */
 int	preempt_is_disabled(void);
 /* current user thread's TCB (provided by usermode.c), or 0 if none */
 struct kthread *cur_proc_kthread(void);
+/*
+ * Take a TCB off whatever run queue it is on (provided by usermode.c).
+ * Called from the free path: a slot that is still chained into a run queue
+ * gets bzeroed when it is reused, and the bzeroed t_runq pointer truncates
+ * the list - every thread behind it becomes unreachable and its CPU goes
+ * idle with the queue looking non-empty.
+ * 中文：把 TCB 从它所在的运行队列上摘下来（由 usermode.c 提供）。释放路径必须
+ * 调用：仍挂在队列上的槽位一旦被复用就会被 bzero，t_runq 清零会把链表截断，
+ * 其后的所有线程都取不到，而对应 CPU 会空转。
+ */
+void	kthread_rq_detach(struct kthread *t);
 
 /* os.md mechanism 4: per-thread IPL policy + priority inheritance */
 void	thread_ipl_set(struct kthread *t, int base_ipl, int preemptable);

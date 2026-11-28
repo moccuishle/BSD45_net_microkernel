@@ -1368,6 +1368,60 @@ done
   "再加一把锁"规避**——S422 就是池锁 vs BKL 锁序反转导致硬死锁（时钟静止）。
   `proctest` 在 TCG 下回收 1000 子进程极慢，只当间歇负载，别拿它的停顿判定死锁。
 
+#### 7.1.1 本轮新增：soak 从"第 26 轮必挂"到 200 轮全绿（2026-11-29）
+
+上一轮把 §7.0.1 的 aio 应答竞态收口后，8 核 soak 从**第 26 轮必挂**推进到
+**第 101 轮**才挂，暴露出两个与 aio 无关的调度器缺陷。两者都是"TCB 可运行
+却永远不被派发"，但机制不同，均已修复并验证。
+
+**① 队列归属错乱（`sched_rq_put` 塞回调用者队列）**
+`proc_sched()` 先 `sched_rq_pick()` 把 TCB 从队列摘下，再 `kthread_claim_cpu()`
+认领；认领失败时把 TCB 塞回**自己的**队列。而 `sched_rq_pick()` 会跳过
+"属主是别核"的 TCB → 属主队列里没有它、别的核又不取它，线程对整机隐身。
+现场转储：`tid 159 state KT_RUN oncpu 4 rq 0`（排在 cpu0 队列、属主是 cpu4）。
+修法：新增 `sched_rq_put_home()`，所有"摘下再放回"的路径放回属主队列；
+`sched_rq_sweep()` 顺带搬回已经错位的。
+
+**② 释放的 TCB 仍挂在运行队列上（本次主因）**
+`kthread_user_free()` / `kthread_reap()` 释放槽位时**没有摘链**。槽位随后被
+`tcb_reserve()` 复用，`kthread_user_spawn()` 会 `bzero` 整块 TCB → 队列链里的
+`t_runq` 被清零，**链表从那里被截断**，其后的线程全部不可达；而 `sc_nrun`
+仍大于 0，队列看起来非空，没有任何路径会修它 → CPU 永久空转。
+现场转储（决定性）：`tid 560 pthread 主线程 state KT_RUN oncpu -1 rq 0
+pstate P_RUN nthr 1`，同进程 4 个兄弟线程全是 `KT_ZOMBIE`——状态字段全部
+说"可运行"，`rq` 还写着 0，CPU0 就是不派发。
+修法：`kthread_user_free()`/`kthread_reap()` 先 `kthread_rq_detach()` 摘链再
+发布槽位；`sched_rq_del()` 改成**锁内复核 `t_runq_cpu`**（原来在锁外读，
+读到旧值就会去摘错的链表、还照样把字段清零）。
+
+**顺带合上同形状的丢唤醒**（都属于"判条件 + 睡下"不是原子动作）：
+`aio_worker` 与 `softirq_thread` 的"队列空就 `kthread_block()`"改为
+`kthread_block_prepare()/kthread_block_commit()`（判空与发布 `KT_BLOCK` 在
+队列锁内一步完成）；`softirq_defer()` 的环形队列加锁；aio 完成回调不再经
+`softirq_defer` 转投（直接在 worker 上下文调用，避免队列满静默丢弃）。
+
+**证据（8 核 / 3 GB，TCG）**
+
+| 版本 | 同序列结果 |
+|---|---|
+| 收口 aio 前 | 第 26 轮必挂（2/2 次） |
+| 收口 aio 后 | 第 101 轮挂（②） |
+| ①+② 修复后 | **200/200 轮全绿**，0 TRAP / 0 `user fault` / 0 转储 |
+| 线程抖动密集序列 | 25 轮 × 4 程序 = 100/100 全绿，58 秒 |
+| 26 套验收 | 24 PASS + 2 已知失效（`test_subsys`/`test_ipl`），与基线一致 |
+
+**测试脚手架同时改好**（`bsd45/tools/`）：
+- `qdrive.py`：`--sync` 按提示符驱动（锚点兼容 `bsd45>` 与 shell 的 `# ` 各
+  种行尾形式）、启动敲空行让监视器重打提示符（启动检测从 300 s 降到 1 s 内）、
+  `--tail-wait`（`exit 0` 后不再耗满 timeout）、`--abort-after`（连续无提示符
+  即判挂死）、`--cmdfile`（绕过 Windows 32 KB 命令行上限）、`--verbose`。
+  实测 3 循环从 7 分 00 秒降到 55 秒。
+- `soak_p1.sh` 已随仓库提供（`bash tools/soak_p1.sh 200 8 3072` ≈ 5 分钟），
+  不再依赖旧 workspace 里的脚本。
+
+**仍未收口**：`smp_user_dispatch` 默认值还是 0（§7.1 第 2 步），需要再做一次
+**不发 `smpuser`** 的默认启动路径验证后才能翻默认值。
+
 ### 7.2 P2 — #10 第 ④ 步：VFS / pipe / pagecache / fd 表分锁
 
 > 目标是把系统调用入口的 BKL 逐路径摘掉；**顺序必须是先给子系统加锁，再摘
