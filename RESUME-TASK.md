@@ -4,8 +4,9 @@
 状态：**S0–S17 全部落地**；P2（BKL 拆分）已推进到 `open(2)`/namei
 （§6.2.17）；微内核路线已放弃并删除实现（§6.2.18）；`kernel/` 下的 x86 汇编
 （含内联）已全部收进 `kernel/arch/i386/`（§6.2.19）；
-**唯一未收口的是 aio 应答丢失修复（§6.2.20）——代码已改完、编译通过、26 套
-验收已跑，只缺 8 核复现验证，改动仍在工作区未提交，见 §7.0.1。**
+**aio 应答丢失修复已收口（2026-11-29）：8 核 2 轮全绿 + 26 套验收，见 §7.0.1。
+关键发现：原 S432 补丁里的 `sched_rq_put()` 改动是回归源（8 核 pthread 2/2
+挂死），已剔除；只保留 `aio_lock` 握手修复。**
 仓库：https://github.com/moccuishle/BSD45_multi_core_process （5 仓同步，见 §0.4）
 
 > **新机器请直接跳到 [§0.4 新机器快速恢复](#04-新机器快速恢复2026-11-26)**：
@@ -1190,17 +1191,36 @@ CPU 时间不涨），改用 `-serial file:` 手工起 QEMU 只证明了 8 核�
    `git commit-tree $(git rev-parse HEAD^{tree}) -p <remote>/main` 生成提交后
    push，最后 `git fetch` 校验 5 棵树一致。
 
-### 7.0.1 P0 — aio 应答丢失修复收尾（未验收，工作区里未提交）
+### 7.0.1 P0 — aio 应答丢失修复（**已收口，2026-11-29 上库**）
 
-> **下次开工从这里开始，不要先动别的。** 背景、症状、根因见 §6.2.20。
-> 一句话：代码改完了、编译过了、26 套验收过了，**只缺 8 核 3 GB 复现验证**。
-> 新机器照下面 0→5 走完即可收口并上库。
+> **已验收。** 8 核 3 GB 同序列跑了两轮，pthread / pthmain / pthpre /
+> aiotest×2 全 PASS，0 TRAP / 0 user fault，`[user exit 0]`；26 套验收
+> 24 PASS + 2 已知失效。下面是收口过程与一条重要更正。
 
-**为什么代码不在 main 上**：改动未经 8 核验证，按本项目的上库规矩（验收通过
-才算完成）不能进 main，因此导出成补丁随文档一起提交：
-`docs/patches/S432-aio-wakeup.patch`（275 行、11 个 hunk，只碰
-`bsd45/kernel/sys/usermode.c`）。已在 HEAD 的 LF 干净树上验证
-`git apply --check` 通过。
+**关键更正：原补丁的 `sched_rq_put()` 改动是回归源，已剔除。**
+
+原 S432 补丁（`docs/patches/S432-aio-wakeup.patch`）含两块：aio 握手锁
+（`aio_lock`）和调度入队归属（`sched_rq_put` 按 `t_oncpu` 强制入队 + nudge）。
+8 核复现时发现：**带全补丁的内核在 `pthreadtest: created 4 threads` 后挂死
+（2/2 次）**，而干净基线同序列全绿。二分实验（只回退 `sched_rq_put`、保留
+`aio_lock`）后 pthread 恢复、aiotest 2/2 PASS。
+
+根因：`t->t_oncpu` 的语义是"**内核栈互斥**"（这个核可能还跑在该 TCB 的栈上），
+不是 CPU 亲和性。`sched_release_prev()` 在切换走时主动把它置 -1，正是为了让
+空闲核也能接手（S424 修的就是"它一度退化为硬亲和"）。补丁用 `t_oncpu` 把线程
+钉回"属主核"队列，重新制造了 S424 已修掉的硬亲和；而它加的 nudge 只在
+`sc_parked` 已置位时才发 IPI，存在 check-then-sleep 的 TOCTOU 窗口 → 线程在
+一个没人扫描的队列上永久隐身、整机 hlt。**aio 的丢唤醒在 aio 层用 `aio_lock`
+收口即可，不要动调度器的入队归属。**
+
+**最终改动**（仅 `kernel/sys/usermode.c`，104 插入 / 16 删除）：新增
+`static struct spinlock aio_lock`；`aio_wait_sys()` 的"扫描槽位 + 检查
+`a_done` + 发布 token + 置 `P_BLOCKED`"合并为一个临界区，`proc_sched()` 前
+解锁；`aio_soft()` 的"判断等待者 + 唤醒 + 释放槽"同锁；`aio_submit_sys()` /
+`aio_poll_sys()` 认领空槽 + 发 token 加锁。锁序 `aio_lock → sc_rqlock`、
+`aio_lock → vfs_lock`，反向不存在。
+
+#### 原始任务卡（存档，步骤 0→5 仍然有效，补丁内容以本节上文为准）
 
 **涉及的东西**（改动全在 `kernel/sys/usermode.c`）：
 

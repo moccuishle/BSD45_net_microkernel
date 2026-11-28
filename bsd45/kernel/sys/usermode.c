@@ -1960,6 +1960,27 @@ static int uring_cqe_push(struct uring_ring *r, unsigned user_data, int res);
 
 static struct aio_slot	aios[NAIO];
 static int		aio_next_token;
+/*
+ * S432: aio_slot handshake lock.
+ *
+ * The waiter (aio_wait_sys) and the completer (aio_soft) used to race on
+ * plain fields: the waiter tested a_done, then blocked, while aio_soft
+ * decided "anybody waiting?" from uk_state.  A completion landing between
+ * those two steps saw P_RUN, concluded nobody was waiting, and left the
+ * waiter asleep on a token that was already complete - a permanent hang
+ * with every CPU idle.  Both sides now take aio_lock around
+ * {test + block} and {test + wake}, so the decision can no longer straddle
+ * the block.
+ * S432：aio 槽的握手锁。原先等待方先查 a_done 再阻塞，完成方靠 uk_state
+ * 判断"有没有人在等"；完成正好落在两步之间时，完成方看到 P_RUN 就认为无人
+ * 等待，等待方随即睡在一个已完成的 token 上——永久挂起且所有 CPU 空转。
+ * 现在两侧都在 aio_lock 内做 {检查+阻塞} 与 {检查+唤醒}。
+ *
+ * Lock order: aio_lock -> sc_rqlock (sched_runnable/sched_unrunnable) and
+ * aio_lock -> vfs_lock (vn_put).  No path takes either of those first.
+ * 锁序：aio_lock -> sc_rqlock、aio_lock -> vfs_lock，反向路径不存在。
+ */
+static struct spinlock	aio_lock;
 
 static void aio_soft(void *arg);
 
@@ -1972,6 +1993,7 @@ aio_user_init(void)
 	unsigned pa;
 
 	bzero(aios, sizeof(aios));
+	spin_init(&aio_lock);
 	aio_next_token = 1;
 	for (i = 0; i < NAIO; i++) {
 		pa = vfs_page_alloc();
@@ -2026,10 +2048,22 @@ aio_soft(void *arg)
 	struct process *p = 0;
 	int i;
 
-	if (s == 0 || s->a_woken)
+	if (s == 0)
 		return;
-	if (s->a_ring != 0)
-		return;			/* ring completion woke the caller */
+	/*
+	 * S432: the whole test-and-wake is one critical section against
+	 * aio_wait_sys().  Without it a completion that arrives while the
+	 * waiter is between "a_done is clear" and "P_BLOCKED is set" finds
+	 * no waiter and the token is never claimed again.
+	 * S432：整个"判断并唤醒"与 aio_wait_sys() 互斥。否则完成落在
+	 * "a_done 仍为 0"与"P_BLOCKED 置位"之间时会找不到等待者，token 再也
+	 * 没人认领。
+	 */
+	spin_lock(&aio_lock);
+	if (s->a_woken || s->a_ring != 0) {
+		spin_unlock(&aio_lock);
+		return;			/* already claimed / ring woke the caller */
+	}
 	for (i = 0; i < NPROC; i++)
 		if (procs[i].uk_state != P_FREE && procs[i].uk_pid == s->a_pid) {
 			p = &procs[i];
@@ -2044,6 +2078,7 @@ aio_soft(void *arg)
 		s->a_used = 0;
 		s->a_woken = 1;
 	}
+	spin_unlock(&aio_lock);
 }
 
 /* 中文：提交一次异步读写：校验 fd、长度与用户缓冲，占用一个 aio 槽，写时拷入用户数据并发起异步 VFS 读写，成功返回 token */
@@ -2063,13 +2098,28 @@ aio_submit_sys(int fd, int op, unsigned ubuf, unsigned len, unsigned off)
 		return (-EINVAL);
 	if (op == KI_READ ? !user_ok_w(ubuf, len) : !user_ok(ubuf, len))
 		return (-EFAULT);
+	/*
+	 * S432: claiming a slot and handing out the token are one step.  Two
+	 * CPUs submitting at the same time used to scan the table, both see
+	 * slot i free, both bzero it and both increment aio_next_token, so
+	 * one submission silently overwrote the other (and the two could end
+	 * up with the same token).  The slot is fully initialised under
+	 * aio_lock; the copy-in and the I/O start happen outside it because
+	 * they can fault and block.
+	 * S432：认领槽位与发 token 必须是一步。两个核同时提交时会都看到同一个
+	 * 空槽，互相覆盖，还可能拿到同一个 token。槽位字段在 aio_lock 内初始化
+	 * 完毕；拷入与发起 I/O 放在锁外，因为它们可能缺页、可能阻塞。
+	 */
+	spin_lock(&aio_lock);
 	for (i = 0; i < NAIO; i++)
 		if (!aios[i].a_used) {
 			s = &aios[i];
 			break;
 		}
-	if (s == 0)
+	if (s == 0) {
+		spin_unlock(&aio_lock);
 		return (-EAGAIN);
+	}
 	{
 		unsigned char *kbuf = s->a_kbuf;
 
@@ -2087,6 +2137,7 @@ aio_submit_sys(int fd, int op, unsigned ubuf, unsigned len, unsigned off)
 	s->a_ubuf = ubuf;
 	s->a_len = len;
 	s->a_off = off;
+	spin_unlock(&aio_lock);
 	if (op == KI_WRITE) {
 		if (ucopyin((void *)ubuf, s->a_kbuf, len) < 0) {
 			s->a_used = 0;
@@ -2119,20 +2170,40 @@ aio_submit_sys(int fd, int op, unsigned ubuf, unsigned len, unsigned off)
 static int
 aio_wait_sys(int token, struct sysregs *r)
 {
-	struct aio_slot *s;
+	struct aio_slot *s = 0;
 	int i, res;
 
+	spin_lock(&aio_lock);
 	for (i = 0; i < NAIO; i++)
 		if (aios[i].a_used && aios[i].a_token == token) {
 			s = &aios[i];
-			goto found;
+			break;
 		}
-	return (-EINVAL);
-found:
+	if (s == 0) {
+		spin_unlock(&aio_lock);
+		return (-EINVAL);
+	}
+	/*
+	 * S432: from here to kthread_block_tcb() is one critical section
+	 * against aio_soft().  Two things it buys us:
+	 *   - a completion that already happened is returned without blocking
+	 *     (the slot cannot be freed under us between the test and the
+	 *     block);
+	 *   - a completion that happens after we blocked always sees
+	 *     P_BLOCKED and the published token, so it always wakes us.
+	 * The spinlock is dropped before proc_sched(): blocking must not
+	 * happen with a spinlock held, but the block *state* is already
+	 * published by kthread_block_tcb().
+	 * S432：从这里到 kthread_block_tcb() 与 aio_soft() 互斥——已完成的
+	 * 直接返回不阻塞；阻塞之后再来的完成一定看到 P_BLOCKED 与已发布的
+	 * token，因此一定会唤醒。锁在 proc_sched() 之前释放：不能在持自旋锁
+	 * 时切换栈，但"已阻塞"这个状态在 kthread_block_tcb() 里已经发布了。
+	 */
 	if (s->a_done) {
 		res = s->a_result;
 		vn_put(s->a_ki.ki_vp);
 		s->a_used = 0;
+		spin_unlock(&aio_lock);
 		return (res);
 	}
 	/*
@@ -2143,6 +2214,7 @@ found:
 	cur->uk_aio_wait_token = token;
 	cur->uk_regs = *r;
 	kthread_block_tcb(0);
+	spin_unlock(&aio_lock);
 	proc_sched();
 	return (0);
 }
@@ -2152,20 +2224,36 @@ found:
 static int
 aio_poll_sys(int token)
 {
-	struct aio_slot *s;
+	struct aio_slot *s = 0;
 	int i, res;
 
+	/*
+	 * S432: same lock as aio_soft() - a poll and a completion softirq
+	 * both free the slot (vn_put + a_used = 0), so without it the same
+	 * vnode reference could be dropped twice.
+	 * S432：与 aio_soft() 用同一把锁——轮询与完成软中断都会释放槽位
+	 * （vn_put + a_used=0），不加锁会把同一个 vnode 引用放两次。
+	 */
+	spin_lock(&aio_lock);
 	for (i = 0; i < NAIO; i++)
 		if (aios[i].a_used && aios[i].a_token == token) {
 			s = &aios[i];
-			if (!s->a_done)
-				return (-EAGAIN);
-			res = s->a_result;
-			vn_put(s->a_ki.ki_vp);
-			s->a_used = 0;
-			return (res);
+			break;
 		}
-	return (-EINVAL);
+	if (s == 0) {
+		spin_unlock(&aio_lock);
+		return (-EINVAL);
+	}
+	if (!s->a_done) {
+		spin_unlock(&aio_lock);
+		return (-EAGAIN);
+	}
+	res = s->a_result;
+	vn_put(s->a_ki.ki_vp);
+	s->a_used = 0;
+	s->a_woken = 1;			/* a later softirq must not re-post it */
+	spin_unlock(&aio_lock);
+	return (res);
 }
 
 /* 中文：向 io_uring 环的完成队列压入一个 CQE（user_data/result），队列满则增加 overflow 并返回 0 */
