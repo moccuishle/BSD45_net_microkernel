@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # soak_p1.sh - 8-core mixed-load soak for RESUME-TASK §7.1 (P1).
 #
-#   bash tools/soak_p1.sh [loops] [smp] [mem]
+#   bash tools/soak_p1.sh [loops] [smp] [mem] [smpuser]
 #
-#     loops  mixed-load iterations              (default 300)
-#     smp    vCPUs                              (default 8)
-#     mem    guest RAM in MB                    (default 3072)
+#     loops    mixed-load iterations              (default 300)
+#     smp      vCPUs                              (default 8)
+#     mem      guest RAM in MB                    (default 3072)
+#     smpuser  1 = send `smpuser` after smpon     (default 1)
+#              0 = leave the AP-dispatch default alone.  Since S432 that
+#              default is ON, so 0 is the "default boot path" run §7.1
+#              step 3 asks for; 1 is still useful to exercise the toggle.
 #
 # Why it is built this way (see §7.1 "3 小时" and qdrive.py --sync):
 #   * ONE QEMU for the whole run.  A boot costs minutes under TCG, so paying
@@ -24,6 +28,7 @@ set -u
 LOOPS=${1:-300}
 SMP=${2:-8}
 MEM=${3:-3072}
+SMPUSER=${4:-1}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 cd "$HERE/.." || exit 1
@@ -38,7 +43,9 @@ rm -f "$CMDFILE" "$LOG" "$VLOG"
 
 {
 	echo smpon
-	echo smpuser
+	if [ "$SMPUSER" != "0" ]; then
+		echo smpuser
+	fi
 	echo shell
 	for ((i = 1; i <= LOOPS; i++)); do
 		echo "/bin/pthread"
@@ -59,7 +66,7 @@ rm -f "$CMDFILE" "$LOG" "$VLOG"
 	echo "exit 0+5"
 } >"$CMDFILE"
 
-echo "soak: $LOOPS loops, smp=$SMP, mem=${MEM}MB, $(wc -l <"$CMDFILE") commands"
+echo "soak: $LOOPS loops, smp=$SMP, mem=${MEM}MB, smpuser=${SMPUSER}, $(wc -l <"$CMDFILE") commands"
 echo "soak: log=$LOG verbose=$VLOG"
 
 python tools/qdrive.py --iso out/BSD45-ELF-x86.iso --mem "$MEM" --smp "$SMP" \

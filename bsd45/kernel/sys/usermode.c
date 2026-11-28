@@ -526,17 +526,41 @@ sched_rq_put(struct kthread *t, int cpu)
 	if (cpu < 0 || cpu >= MAXCPU)
 		cpu = 0;
 	sc = &sched_cpu[cpu];
+	/*
+	 * S432: claim the single "this TCB is being queued" right with an atomic
+	 * exchange on t_runq_cpu instead of testing it under this CPU's queue
+	 * lock.  Two CPUs queueing the same TCB hold two *different* locks, so a
+	 * plain "if (t_runq_cpu < 0)" let both in: the second one overwrote
+	 * t->t_runq - the forward link of the first list - and cut that queue in
+	 * half.  Only the CPU that moves t_runq_cpu from -1 to `cpu` links.
+	 * S432：入队权用 t_runq_cpu 上的原子交换来抢，而不是在本核队列锁里判。
+	 * 两个核给同一个 TCB 入队时拿的是两把不同的锁，原先的 "if (<0)" 会放两
+	 * 个都进去，后一个覆盖 t->t_runq（前一条链表的前向指针），把那条队列拦腰
+	 * 截断。只有把 t_runq_cpu 从 -1 改成 cpu 的那个核才真正挂链。
+	 */
+	if (atomic_cmpxchg(&t->t_runq_cpu, -1, cpu) != -1)
+		return;			/* already queued somewhere */
 	spin_lock(&sc->sc_rqlock);
-	if (t->t_runq_cpu < 0) {
-		t->t_runq = 0;
-		if (sc->sc_rqtail != 0)
-			sc->sc_rqtail->t_runq = t;
-		else
-			sc->sc_rqhead = t;
-		sc->sc_rqtail = t;
-		t->t_runq_cpu = cpu;
-		sc->sc_nrun++;
-	}
+	/*
+	 * S432: a truncated list leaves sc_rqhead == 0 with a stale tail.  New
+	 * TCBs would chain onto that unreachable tail forever, so nrun grows
+	 * while the head stays empty ("cpu5 nrun 14 head -1").  Forget a tail
+	 * that has no head: the entries it names are already lost, and keeping
+	 * them would make the loss permanent.
+	 * S432：链表被截断后会出现 head 为 0、tail 仍指向旧节点。新 TCB 会一直
+	 * 挂在那个不可达的尾巴上，于是 nrun 增长而 head 恒空（"cpu5 nrun 14
+	 * head -1"）。没有头的尾巴直接丢掉：它指向的节点已经丢了，留着只会让
+	 * 丢失永久化。
+	 */
+	if (sc->sc_rqhead == 0)
+		sc->sc_rqtail = 0;
+	t->t_runq = 0;
+	if (sc->sc_rqtail != 0)
+		sc->sc_rqtail->t_runq = t;
+	else
+		sc->sc_rqhead = t;
+	sc->sc_rqtail = t;
+	sc->sc_nrun++;
 	spin_unlock(&sc->sc_rqlock);
 }
 
@@ -585,7 +609,7 @@ sched_rq_del(struct kthread *t)
 	 * 链表、找不到、却仍然把 t_runq_cpu 清零，于是 TCB 实际仍挂在原链表里，
 	 * 却对外宣称不在任何队列上。这里在锁内复核归属，变了就重来。
 	 */
-	for (tries = 0; tries < 4; tries++) {
+	for (tries = 0; tries < 8; tries++) {
 		cpu = t->t_runq_cpu;
 		if (cpu < 0)
 			return;
@@ -599,18 +623,35 @@ sched_rq_del(struct kthread *t)
 		}
 		for (p = sc->sc_rqhead, prev = 0; p != 0;
 		     prev = p, p = p->t_runq) {
-			if (p != t)
-				continue;
-			if (prev != 0)
-				prev->t_runq = t->t_runq;
-			else
-				sc->sc_rqhead = t->t_runq;
-			if (sc->sc_rqtail == t)
-				sc->sc_rqtail = prev;
-			if (sc->sc_nrun > 0)
-				sc->sc_nrun--;
-			break;
+			if (p == t)
+				break;
 		}
+		if (p == 0) {
+			/*
+			 * Not in the list it claims.  Either a put has already
+			 * claimed the slot and is waiting for this very lock
+			 * (retry), or the claim is simply wrong.  Never clear
+			 * t_runq here: t->t_runq is the forward link of the
+			 * list the TCB really is in, and zeroing it cuts that
+			 * list in half - every TCB behind it becomes
+			 * unreachable while sc_nrun keeps saying non-empty.
+			 * S432：它并不在自称的那条链表里。要么某个 put 已经抢到
+			 * 入队权、正在等这把锁（重试即可），要么这个归属本身是错的。
+			 * 这里绝不能清 t_runq——它正是该 TCB 真正所在链表的前向指针，
+			 * 清零就把那条链拦腰截断，其后的 TCB 全部不可达，而 sc_nrun
+			 * 仍宣称非空。
+			 */
+			spin_unlock(&sc->sc_rqlock);
+			continue;
+		}
+		if (prev != 0)
+			prev->t_runq = t->t_runq;
+		else
+			sc->sc_rqhead = t->t_runq;
+		if (sc->sc_rqtail == t)
+			sc->sc_rqtail = prev;
+		if (sc->sc_nrun > 0)
+			sc->sc_nrun--;
 		t->t_runq = 0;
 		t->t_runq_cpu = -1;
 		spin_unlock(&sc->sc_rqlock);
@@ -4388,16 +4429,26 @@ unsigned sched_switches;
 
 /*
  * S413: runtime switch for AP user-thread dispatch (monitor `smpuser`).
- * Default OFF: smpon brings the APs up (per-CPU TSS, scheduler state, IPI),
- * and `smpuser` additionally lets them dispatch user threads.  It is off by
- * default because some workloads still trip over the coarse kernel locking
- * (see os_smp.md section 7); with it off the system behaves exactly like the
- * single-CPU build, only with the APs parked in hlt.
+ * Default ON.  smpon brings the APs up (per-CPU TSS, scheduler state, IPI);
+ * this switch decides whether they also dispatch user threads.  It used to
+ * default off because some workloads still tripped over the coarse kernel
+ * locking (see os_smp.md section 7); with it off the system behaves exactly
+ * like the single-CPU build, only with the APs parked in hlt.
  * S413：AP 运行用户线程的运行时开关（monitor `smpuser`）。默认开：
  * smpon + 这个开关才让用户线程真正跑在多个核上。关掉后 AP 仍在线（IPI 通路
  * 正常），但只有 BSP 做调度——遇到内核锁粒度不足导致的负载时，这是安全退路。
+ *
+ * S432: 默认改为 ON。原来的 OFF 是"AP 派发用户线程还会踩内核粗粒度锁"时期的
+ * 安全退路；§7.1 的 200 轮 8 核 soak（0 TRAP / 0 user fault / 0 挂死）与 26 套
+ * 验收之后，默认路径已经是"AP 一起调度"。`smpuser` 保留为应急开关：敲一次即可
+ * 退回 BSP-only，不需要重新编译。
+ * S432: default flipped to ON.  OFF was the safe retreat while coarse kernel
+ * locking still tripped up AP user dispatch; after the 200-round 8-core soak
+ * (0 TRAP / 0 user fault / 0 hang) and the 26 acceptance suites the default
+ * path is "APs schedule too".  `smpuser` stays as the emergency switch: one
+ * command drops back to BSP-only without a rebuild.
  */
-int	smp_user_dispatch = 0;
+int	smp_user_dispatch = 1;
 
 /*
  * S413: need_resched is per-CPU now (see sched_cpu above).  The clock

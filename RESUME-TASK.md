@@ -349,10 +349,11 @@ ALL SUITES PASSED
 
 ### 6.1 SMP / TRAP 12（判定收敛，但未彻底收口）— 最高优先
 
-1. **`smp_user_dispatch` 仍默认 0**。user fault 已清零、BSP TRAP 12 判定收敛
-   （S421 后累计 16 轮加压 0 复现，见 `os_smp.md` §15.6），但故障曾为极低频
-   偶发。默认打开前需做**长时间 soak**（建议数小时混合负载），确认不再复现后
-   再把默认值改为 1。手动 `smpon` + `smpuser` 当前可用于演示多核用户调度。
+1. **`smp_user_dispatch` 默认值已改为 1（S432 收口）**。user fault 已清零、
+   BSP TRAP 12 判定收敛（S421 后累计多轮加压 0 复现，见 `os_smp.md` §15.6）；
+   8 核 200 轮混合 soak（含并发读/线程创建/join/preempt/aio）0 TRAP、0 fault、
+   0 挂死，26 套验收与基线一致，**不发 `smpuser` 的默认启动路径**也已验证。
+   `smpuser` 保留为应急开关（敲一次退回 BSP-only，无需重编）。详见 §7.1.1。
 2. **TRAP 12 未从机制上根治**：收敛很可能是 S421 修正 CR3/cur_pd 失配的连带
    效果，而非定位到独立根因。若 soak 中复现，用 `os_smp.md` §12/§15 的反汇编
    方法（`cmpl $1,(%eax)`、崩溃点 `cpus[cid].ci_curthread`）重新取证。
@@ -1394,6 +1395,37 @@ pstate P_RUN nthr 1`，同进程 4 个兄弟线程全是 `KT_ZOMBIE`——状态
 发布槽位；`sched_rq_del()` 改成**锁内复核 `t_runq_cpu`**（原来在锁外读，
 读到旧值就会去摘错的链表、还照样把字段清零）。
 
+**③ 运行队列的入队/出队不是原子的（翻默认值后暴露）**
+把 `smp_user_dispatch` 默认改成 1 之后，默认路径 soak **在第 157 轮停住**，转储里
+出现了决定性的矛盾：
+
+```
+cpu5 nrun 14 head -1:        ← 队列声称 14 个可运行，链表头却是空的
+```
+
+成因链：
+- `sched_rq_put()` 在**本核队列锁**里判 `t_runq_cpu < 0` 再挂链，而两个核给同一个
+  TCB 入队时拿的是**两把不同的锁** → 两个都通过，后一个覆盖 `t->t_runq`（前一条
+  链表的前向指针），把那条队列截断；
+- `sched_rq_del()` 在"声称的队列里找不到这个 TCB"时**仍然清零 `t_runq`** —— 而它
+  正是该 TCB 真正所在链表的前向指针，一清零就把那条链拦腰截断；
+- 截断后若 `head` 被取走，`tail` 仍指向已经不可达的旧节点，后续 `put` 全部挂在
+  "没有头的尾巴"上：`nrun` 一直涨、`head` 恒为空，**整机再也取不到任何一个**。
+
+修法：
+- 入队权改成 `atomic_cmpxchg(&t->t_runq_cpu, -1, cpu)` 抢占，只有抢到的核才挂链；
+- `sched_rq_del()` 只在**真正找到**该 TCB 时才摘链、才清零；找不到就重试（最多
+  8 次），**绝不清 `t_runq`**；
+- `sched_rq_put()` 遇到 `head == 0` 但 `tail != 0` 的残留尾巴时丢掉尾巴（那些节点
+  已经丢了，留着只会让丢失永久化）。
+
+**证据（同一份 200 轮默认路径 soak，全程不发 `smpuser`）**
+
+| 版本 | 结果 |
+|---|---|
+| 仅 ①②，`smp_user_dispatch=1` | **第 157 轮挂**（`cpu5 nrun 14 head -1`） |
+| 加 ③ | **200/200 全绿**，rc=0、`[user exit 0]`、0 TRAP / 0 fault / 0 转储，2 分 15 秒 |
+
 **顺带合上同形状的丢唤醒**（都属于"判条件 + 睡下"不是原子动作）：
 `aio_worker` 与 `softirq_thread` 的"队列空就 `kthread_block()`"改为
 `kthread_block_prepare()/kthread_block_commit()`（判空与发布 `KT_BLOCK` 在
@@ -1407,6 +1439,7 @@ pstate P_RUN nthr 1`，同进程 4 个兄弟线程全是 `KT_ZOMBIE`——状态
 | 收口 aio 前 | 第 26 轮必挂（2/2 次） |
 | 收口 aio 后 | 第 101 轮挂（②） |
 | ①+② 修复后 | **200/200 轮全绿**，0 TRAP / 0 `user fault` / 0 转储 |
+| ①+②+③，默认路径 | **200/200 轮全绿**，同上 |
 | 线程抖动密集序列 | 25 轮 × 4 程序 = 100/100 全绿，58 秒 |
 | 26 套验收 | 24 PASS + 2 已知失效（`test_subsys`/`test_ipl`），与基线一致 |
 
@@ -1416,11 +1449,16 @@ pstate P_RUN nthr 1`，同进程 4 个兄弟线程全是 `KT_ZOMBIE`——状态
   `--tail-wait`（`exit 0` 后不再耗满 timeout）、`--abort-after`（连续无提示符
   即判挂死）、`--cmdfile`（绕过 Windows 32 KB 命令行上限）、`--verbose`。
   实测 3 循环从 7 分 00 秒降到 55 秒。
-- `soak_p1.sh` 已随仓库提供（`bash tools/soak_p1.sh 200 8 3072` ≈ 5 分钟），
-  不再依赖旧 workspace 里的脚本。
+- `soak_p1.sh` 已随仓库提供（`bash tools/soak_p1.sh 200 8 3072 [0|1]`，第 4 个
+  参数 0 = 不发 `smpuser`，即默认路径），不再依赖旧 workspace 里的脚本。
 
-**仍未收口**：`smp_user_dispatch` 默认值还是 0（§7.1 第 2 步），需要再做一次
-**不发 `smpuser`** 的默认启动路径验证后才能翻默认值。
+**§7.1 收口**：`smp_user_dispatch` 默认值已改为 1（`usermode.c`），`smpuser`
+保留为应急开关（敲一次退回 BSP-only，无需重编）。默认路径 200 轮 soak 全绿、
+26 套验收与基线一致，第 3 步要求的"不发 `smpuser` 的默认启动路径"已验证。
+
+**注意**：`kthread dump (idle >2s)` 是探针，机器**只是空闲**（工作负载已结束、
+只剩 init）时也会打一次，不要把这种转储当成挂死证据——要看里面的
+`state/pstate/nthr` 是否自相矛盾。
 
 ### 7.2 P2 — #10 第 ④ 步：VFS / pipe / pagecache / fd 表分锁
 
@@ -1437,8 +1475,8 @@ pstate P_RUN nthr 1`，同进程 4 个兄弟线程全是 `KT_ZOMBIE`——状态
 > 一个原子动作后，路径级锁就不需要了（详见 §6.2.17）。
 > 注意：8 核基线里的 `smpuser` 一直把 `smp_user_dispatch` 打开，所以上面
 > 每一步的 8 核验证**都是在 AP 派发用户线程的前提下**跑出来的。
-> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**；P1 仍未收口，
-> `smp_user_dispatch` 默认值还是 0，等 §7.1 的数小时 soak。
+> **下一步看 [§7.2.1](#721-下一步可直接动手2026-11-26-交接)**；P1 已收口
+> （`smp_user_dispatch` 默认值改为 1，见 §7.1.1），剩下的主线是 §7.2 的分锁。
 
 - **代码起点**：
   - 系统调用入口：`kernel/sys/usermode.c:7492` 附近
@@ -1520,9 +1558,10 @@ BKL。下面按"风险从低到高、每次只动一条路径"排好序，
      JLFS/FFS 仍留在 BKL 内。
 
 配套要做的事：
-- **P1 仍未收口**：`smp_user_dispatch` 默认值还是 0。要改成 1，需要一次
-  **3 小时以上**的 8 核混合负载 soak（`soak_p1.sh`：`bash soak_p1.sh 20 30`
-  约 3 小时），确认 TRAP 12 不再出现。现在可用的最强负载是
+- **P1 已收口**：`smp_user_dispatch` 默认值改为 1（§7.1.1）。8 核 200 轮混合
+  负载 soak（`bash tools/soak_p1.sh 200 8 3072 0`，第 4 参数 0 = 默认路径）
+  0 TRAP / 0 fault / 0 挂死，26 套验收与基线一致。想再压更久就直接加轮数：
+  `bash tools/soak_p1.sh 2000 8 3072 0`（约 25 分钟）。最强负载仍是
   `rdstress`（并发读）+ `proctest`（1000 进程）+ `pthread/pthpre`。
 - **每摘一条路径就扩大一次 `rdstress`**：把新路径也写进
   `libexec/rdstress.c`（例如加上 lseek/stat 的循环），让并发证据跟着代码走。
